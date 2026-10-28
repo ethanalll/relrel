@@ -11,10 +11,10 @@ import torch
 from torch_frame import stype
 from tqdm import tqdm
 
-from plurel.config import DAGParams, SCMParams
-from plurel.dag import DAG_REGISTRY
-from plurel.ts import CategoricalTSDataGenerator, TSDataGenerator
-from plurel.utils import (
+from relrel.config import DAGParams, SCMParams
+from relrel.dag import DAG_REGISTRY
+from relrel.ts import CategoricalTSDataGenerator, TSDataGenerator
+from relrel.utils import (
     MLP,
     CategoricalDecoder,
     CategoricalEncoder,
@@ -263,7 +263,7 @@ class SCM:
                     edge_idx += 1
 
     def generate_row(self, row_idx: int):
-        row = {self.pkey_col: row_idx}
+        row = {self.pkey_col: row_idx} if self.pkey_col is not None else {}
         foreign_row_idxs = []
         foreign_scms = []
         for fkey_col, foreign_table_name in self.fkey_col_to_pkey_table.items():

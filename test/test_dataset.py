@@ -1,7 +1,7 @@
 import pytest
 
-from plurel.config import Choices, Config, DatabaseParams
-from plurel.dataset import SyntheticDataset
+from relrel.config import Choices, Config, DatabaseParams
+from relrel.dataset import SyntheticDataset
 
 
 @pytest.mark.parametrize("seed", list(range(10)))

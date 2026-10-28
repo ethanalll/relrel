@@ -160,6 +160,40 @@ class DAGParams:
 
 
 @dataclass(frozen=True)
+class RSCMParams:
+    """Column-DAG locality, row grounding and resource controls."""
+
+    max_hops: int = 2
+    column_parent_cap: int = 8
+    parent_policy: str = "bounded"
+    cell_parent_cap_per_edge: int = 8
+    row_pooling: str = "mean"
+    batch_size: int = 1024
+    index_memory_bytes: int = 512 * 1024**2
+    temp_memory_bytes: int = 256 * 1024**2
+    parent_map_memory_bytes: int = 256 * 1024**2
+
+    def __post_init__(self):
+        if type(self.max_hops) is not int or self.max_hops not in (1, 2):
+            raise ValueError("max_hops must be 1 or 2")
+        for name, minimum in (
+            ("column_parent_cap", 0),
+            ("cell_parent_cap_per_edge", 1),
+            ("batch_size", 1),
+            ("index_memory_bytes", 1),
+            ("temp_memory_bytes", 1),
+            ("parent_map_memory_bytes", 1),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if self.parent_policy not in ("full", "bounded"):
+            raise ValueError("parent_policy must be 'full' or 'bounded'")
+        if self.row_pooling not in ("mean", "sum"):
+            raise ValueError("row_pooling must be 'mean' or 'sum'")
+
+
+@dataclass(frozen=True)
 class Config:
     """
     Top-level configuration for synthetic database generation.
@@ -181,3 +215,9 @@ class Config:
     test_split: float = 0.9
     cache_dir: str | None = None
     schema_file: str | None = None
+    generation_mode: str = "legacy_scm"
+    rscm: RSCMParams = field(default_factory=RSCMParams)
+
+    def __post_init__(self):
+        if self.generation_mode not in ("legacy_scm", "global_rscm"):
+            raise ValueError("generation_mode must be 'legacy_scm' or 'global_rscm'")

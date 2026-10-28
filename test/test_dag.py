@@ -1,7 +1,7 @@
 import pytest
 
-from plurel.config import DAGParams
-from plurel.dag import DAG_REGISTRY
+from relrel.config import DAGParams
+from relrel.dag import DAG_REGISTRY
 
 NODE_COUNTS = [10, 20, 50, 100]
 

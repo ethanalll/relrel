@@ -2,8 +2,8 @@ from pathlib import Path
 
 import numpy as np
 
-from plurel import Config, SyntheticDataset
-from plurel.utils import set_random_seed
+from relrel import Config, SyntheticDataset
+from relrel.utils import set_random_seed
 
 
 def is_valid_db(db):

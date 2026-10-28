@@ -4,7 +4,7 @@ import networkx as nx
 import pytest
 from torch_frame import stype
 
-from plurel.schema import SQLSchemaGraphBuilder
+from relrel.schema import SQLSchemaGraphBuilder
 
 
 def test_tables_present(parsed_tables):

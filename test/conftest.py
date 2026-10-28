@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from plurel.schema import SQLSchemaGraphBuilder
+from relrel.schema import SQLSchemaGraphBuilder
 
 
 @pytest.fixture

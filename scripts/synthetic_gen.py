@@ -6,9 +6,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from plurel.config import Config
-from plurel.dataset import SyntheticDataset
-from plurel.utils import set_random_seed
+from relrel.config import Config
+from relrel.dataset import SyntheticDataset
+from relrel.utils import set_random_seed
 
 
 def generate_rel_synthetic_db(seed: int, preprocess: bool = False):

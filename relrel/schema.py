@@ -19,8 +19,8 @@ from sqlalchemy import (
 from sqlalchemy.exc import SQLAlchemyError
 from torch_frame import stype
 
-from plurel.config import Config
-from plurel.dag import DAG_REGISTRY
+from relrel.config import Config
+from relrel.dag import DAG_REGISTRY
 
 
 class RandomSchemaGraphBuilder:

@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from plurel.config import SCMParams
+from relrel.config import SCMParams
 
 
 def set_random_seed(seed: int):

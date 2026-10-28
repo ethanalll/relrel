@@ -7,8 +7,8 @@ import abc
 import networkx as nx
 import numpy as np
 
-from plurel.config import DAGParams
-from plurel.utils import set_random_seed
+from relrel.config import DAGParams
+from relrel.utils import set_random_seed
 
 
 class DAG(abc.ABC):

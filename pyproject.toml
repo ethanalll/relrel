@@ -1,5 +1,5 @@
 [project]
-name = "plurel"
+name = "relrel"
 requires-python = ">=3.12"
 version = "0.1.0"
 
@@ -15,7 +15,7 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.pypi-dependencies]
-plurel = { path = ".", editable = true }
+relrel = { path = ".", editable = true }
 torch = ">=2.8.0"
 sentence_transformers = "*"
 einops = "*"
