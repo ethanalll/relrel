@@ -33,7 +33,6 @@ from relrel.utils import TableType, get_bipartite_hsbm
 
 def tiny_config(**kwargs):
     return Config(
-        generation_mode="global_rscm",
         database_params=DatabaseParams(
             num_tables_choices=Choices("set", [3]),
             num_cols_choices=Choices("range", [3, 3]),
@@ -246,12 +245,20 @@ def test_relbench_cache_and_metadata(tmp_path):
             assert arrays[key].dtype.kind == "i"
     with pytest.raises(ValueError, match="configuration differs"):
         SyntheticDataset(1, config).get_db(False)
-    with pytest.raises(ValueError, match="legacy"):
-        SyntheticDataset(0, replace(config, generation_mode="legacy_scm")).get_db(False)
+    marker = tmp_path / "cache/generation.json"
+    old_identity = json.loads(marker.read_text())
+    del old_identity["categorical_export_version"]
+    marker.write_text(json.dumps(old_identity))
+    with pytest.raises(ValueError, match="older categorical export"):
+        SyntheticDataset(0, config).get_db(False)
 
 
-def test_sql_schema_and_implicit_row_identity(schema_sql):
-    dataset = SyntheticDataset(0, tiny_config(schema_file=str(schema_sql)))
+@pytest.mark.parametrize("alphas", [None, (1, 5)])
+def test_sql_schema_and_implicit_row_identity(schema_sql, alphas):
+    config = tiny_config(
+        schema_file=str(schema_sql), rscm=RSCMParams(categorical_alpha_choices=alphas)
+    )
+    dataset = SyntheticDataset(0, config)
     db = dataset.make_db()
     assert set(db.table_dict) == {"users", "orders", "products", "order_items"}
     assert db.table_dict["order_items"].pkey_col == "row_idx"
@@ -267,6 +274,9 @@ def test_sql_schema_and_implicit_row_identity(schema_sql):
         {"row_pooling": "max"},
         {"parent_policy": "truncate"},
         {"batch_size": 0},
+        {"categorical_alpha_choices": (0,)},
+        {"column_degree_choices": ()},
+        {"column_degree_choices": (-1,)},
     ],
 )
 def test_invalid_settings_fail(settings):
@@ -278,13 +288,124 @@ def test_memory_budget_and_configuration_identity():
     with pytest.raises(MemoryError):
         Skeleton.from_arrays({"a": 100}, {}, index_memory_bytes=1)
     assert config_fingerprint(Config()) == config_fingerprint(Config())
+    assert Config().generation_mode == "global_rscm"
     with pytest.raises(ValueError, match="generation_mode"):
-        Config(generation_mode="unknown")
+        Config(generation_mode="legacy_scm")
 
 
-def test_legacy_sql_without_primary_key_has_no_phantom_column(schema_sql):
-    config = replace(tiny_config(schema_file=str(schema_sql)), generation_mode="legacy_scm")
-    db = SyntheticDataset(0, config).make_db()
-    table = db.table_dict["order_items"]
-    assert table.pkey_col is None
-    assert all(isinstance(name, str) for name in table.df.columns)
+def test_categorical_export_keeps_constant_features_and_multiclass_ids():
+    frame = pd.DataFrame(
+        {
+            "binary": [1, 1, 1],
+            "constant_multiclass": [2, 2, 2],
+            "multiclass": [0, 1, 2],
+            "string": [1, 1, 1],
+            "numeric": [4.0, 4.0, 4.0],
+        }
+    )
+    columns = {
+        name: {"_stype": stype.categorical, "categories": categories}
+        for name, categories in {
+            "binary": [0, 1],
+            "constant_multiclass": [0, 1, 2],
+            "multiclass": [0, 1, 2],
+            "string": ["a", "b"],
+        }.items()
+    }
+    columns["numeric"] = {"_stype": stype.numerical, "categories": None}
+    exported = SyntheticDataset.process_categorical_data(frame, columns)
+    pd.testing.assert_frame_equal(
+        exported,
+        pd.DataFrame(
+            {
+                "binary": [True, True, True],
+                "constant_multiclass": [2, 2, 2],
+                "multiclass": [0, 1, 2],
+                "string": ["b", "b", "b"],
+                "numeric": [4.0, 4.0, 4.0],
+            }
+        ),
+    )
+
+
+def test_column_degree_prior_respects_budget_locality_and_cap():
+    columns = [Column(table, f"x{i}") for table in "abc" for i in range(6)]
+    roles = [FKRole("a_id", "b", "a"), FKRole("b_id", "c", "b")]
+    params = RSCMParams(max_hops=1, column_degree_choices=(0, 2, 4), column_parent_cap=3)
+    draws = set()
+    for seed in range(12):
+        graph = sample_column_graph(columns, roles, SCMParams(), Config().dag_params, params, seed)
+        target = graph.metadata["target_degree"]
+        draws.add(target)
+        assert 2 * len(graph.edges) / len(columns) == target
+        assert all(len(edge.path) <= 1 for edge in graph.edges)
+        assert all(len(graph.incoming(column)) <= 3 for column in columns)
+    assert draws == {0, 2, 4}
+
+    params = replace(params, column_degree_choices=(20,))
+    graph = sample_column_graph(columns, roles, SCMParams(), Config().dag_params, params)
+    assert len(graph.edges) == graph.metadata["eligible_edges_after_cap"]
+    assert graph.metadata["realized_degree"] < graph.metadata["target_degree"]
+
+
+def test_quantile_cutoffs_match_prior_and_stay_fixed_under_intervention():
+    source, target = Column("a", "source"), Column("a", "target")
+    edge = EdgeSpec(source, target, ())
+    count = 100
+    tables = {"a": numeric_table(["source", "target"])}
+    tables["a"]["columns"]["target"] = {"_stype": stype.categorical, "categories": [0, 1, 2]}
+    config = tiny_config(
+        rscm=RSCMParams(categorical_alpha_choices=(5,), batch_size=13),
+        scm_params=SCMParams(mlp_emb_dim=1),
+    )
+    generator = GlobalSCMGenerator(
+        tables,
+        ColumnGraph((source, target), (edge,), (source, target)),
+        Skeleton.from_arrays({"a": count}, {}),
+        config,
+    )
+    generator._source = lambda column: torch.arange(count, dtype=torch.float32)
+    generator.encoders[edge.identity] = lambda values: values
+    generator.decoders[target] = lambda latent: latent[:, 0]
+    generator.noise_distributions[target] = ZeroNoise()
+    # An intervention on the first call must still use observational cutoffs.
+    changed = generator.evaluate({source: np.arange(count) + count})["a"]["target"]
+    assert (changed == 2).all()
+    calibration = generator.category_calibrations[target]
+    baseline = generator.evaluate()["a"]["target"]
+    cumulative = np.cumsum(calibration["baseline_counts"])[:-1]
+    np.testing.assert_array_equal(
+        cumulative, np.rint(count * np.cumsum(calibration["target_proportions"])[:-1])
+    )
+    np.testing.assert_array_equal(np.bincount(baseline), calibration["baseline_counts"])
+    assert generator.category_calibrations[target] is calibration
+
+    tied = Column("a", "tied")
+    tables["a"]["columns"]["tied"] = {"_stype": stype.categorical, "categories": [0, 1]}
+    tied_labels = generator._quantile_categories(tied, torch.zeros(count))
+    assert len(tied_labels.unique()) == 1
+    assert generator.category_calibrations[tied]["distinct_baseline_scores"] == 1
+
+
+@pytest.mark.parametrize("category_count", [2, 3])
+@pytest.mark.parametrize("alphas", [None, (1, 5)])
+def test_export_preserves_columns_and_round_trips(tmp_path, category_count, alphas):
+    config = tiny_config(
+        cache_dir=str(tmp_path / "cache"),
+        rscm=RSCMParams(categorical_alpha_choices=alphas, column_degree_choices=(2,)),
+        scm_params=SCMParams(
+            col_stype_choices=Choices("set", [stype.categorical]),
+            num_categories_choices=Choices("set", [category_count]),
+        ),
+    )
+    dataset = SyntheticDataset(3, config)
+    exported = dataset.get_db(False)
+    loaded = SyntheticDataset(3, config).get_db(False)
+    for name, table in exported.table_dict.items():
+        pd.testing.assert_frame_equal(table.df, loaded.table_dict[name].df)
+    expected_calibrations = len(dataset.column_graph.columns) if alphas else 0
+    assert len(dataset.generator.category_calibrations) == expected_calibrations
+    for column, raw in dataset.generator.raw_values.items():
+        values = exported.table_dict[column.table].df[column.name]
+        assert values.dtype.kind == ("b" if category_count == 2 else "i")
+        np.testing.assert_array_equal(values, raw.numpy())

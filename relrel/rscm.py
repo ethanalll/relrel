@@ -273,6 +273,39 @@ def enumerate_schema_paths(
     return tuple(paths)
 
 
+def _sample_degree_proposal(assignment, paths_between, params, seed):
+    """Sample from schema-local edges ordered by the random column assignment."""
+    rng = np.random.default_rng(keyed_seed(seed, "column-degree-prior"))
+    target_degree = float(rng.choice(params.column_degree_choices))
+    exact_budget = len(assignment) * (target_degree / 2)
+    requested_edges = math.floor(exact_budget)
+    requested_edges += int(rng.random() < exact_budget - requested_edges)
+    candidates = []
+    for target, target_column in enumerate(assignment):
+        parents = [
+            source
+            for source, source_column in enumerate(assignment[:target])
+            if paths_between(target_column.table, source_column.table)
+        ]
+        if len(parents) > params.column_parent_cap:
+            parents = rng.choice(parents, size=params.column_parent_cap, replace=False)
+        candidates.extend((int(source), target) for source in parents)
+    edge_count = min(requested_edges, len(candidates))
+    selected = rng.choice(len(candidates), size=edge_count, replace=False)
+    proposal = nx.DiGraph()
+    proposal.add_nodes_from(range(len(assignment)))
+    proposal.add_weighted_edges_from(
+        (*candidates[index], float(weight))
+        for index, weight in zip(selected, rng.standard_normal(edge_count), strict=True)
+    )
+    return proposal, {
+        "target_degree": target_degree,
+        "requested_edges": requested_edges,
+        "eligible_edges_after_cap": len(candidates),
+        "realized_degree": 2 * edge_count / len(assignment) if assignment else 0.0,
+    }
+
+
 def sample_column_graph(
     columns: Sequence[Column] | Mapping[str, Sequence[str]],
     fk_roles: Sequence[FKRole],
@@ -286,8 +319,9 @@ def sample_column_graph(
 ) -> ColumnGraph:
     """Sample a proposal, associate feature identities, mask, cap and order.
 
-    Incoming edges use independent keyed priorities before capping. Thus a
-    locality change never resamples the proposal, assignment or priorities.
+    In family-based mode, incoming edges use independent keyed priorities
+    before capping, so locality changes do not resample the proposal.
+    In degree-prior mode, the sampler draws directly from feasible edges.
     ``proposal`` and ``column_assignment`` support frozen structural fixtures.
     No connectivity repair is performed after the locality mask.
     """
@@ -300,8 +334,32 @@ def sample_column_graph(
         raise ValueError("FK role identities must be unique")
     n = len(columns)
     proposal_seed = keyed_seed(seed, "column-proposal")
+    if column_assignment is None:
+        permutation = np.random.default_rng(keyed_seed(seed, "column-association")).permutation(n)
+        assignment = tuple(columns[int(i)] for i in permutation)
+    else:
+        assignment = tuple(column_assignment)
+        if len(assignment) != n or set(assignment) != set(columns):
+            raise ValueError("Column association must be a permutation of the feature inventory")
+
+    path_cache = {}
+
+    def paths_between(target_table, source_table):
+        key = (target_table, source_table)
+        if key not in path_cache:
+            path_cache[key] = enumerate_schema_paths(*key, fk_roles, rscm_params.max_hops)
+        return path_cache[key]
+
+    degree_metadata = {}
     family = "frozen"
-    if proposal is None:
+    if rscm_params.column_degree_choices is not None:
+        if proposal is not None:
+            raise ValueError("A frozen proposal cannot be combined with a column degree prior")
+        family = "degree_prior"
+        proposal, degree_metadata = _sample_degree_proposal(
+            assignment, paths_between, rscm_params, seed
+        )
+    elif proposal is None:
         if n < 2:
             proposal = nx.DiGraph()
             proposal.add_nodes_from(range(n))
@@ -328,15 +386,6 @@ def sample_column_graph(
     proposal.add_nodes_from(range(n))
     if not nx.is_directed_acyclic_graph(proposal):
         raise ValueError("The global column proposal must be a DAG")
-    if column_assignment is None:
-        permutation = np.random.default_rng(keyed_seed(seed, "column-association")).permutation(n)
-        assignment = tuple(columns[int(i)] for i in permutation)
-    else:
-        assignment = tuple(column_assignment)
-        if len(assignment) != n or set(assignment) != set(columns):
-            raise ValueError("Column association must be a permutation of the feature inventory")
-
-    path_cache = {}
     candidates: dict[Column, list[EdgeSpec]] = {}
     proposed_edges = []
     masked = 0
@@ -346,10 +395,7 @@ def sample_column_graph(
         if not math.isfinite(weight):
             raise ValueError("Proposal weights must be finite")
         proposed_edges.append([int(u), int(v), weight])
-        key = (target.table, source.table)
-        if key not in path_cache:
-            path_cache[key] = enumerate_schema_paths(*key, fk_roles, rscm_params.max_hops)
-        paths = path_cache[key]
+        paths = paths_between(target.table, source.table)
         if not paths:
             masked += 1
             continue
@@ -396,6 +442,7 @@ def sample_column_graph(
             "parent_cap_policy": "independent_keyed_priority",
             "max_hops": rscm_params.max_hops,
             "column_parent_cap": rscm_params.column_parent_cap,
+            **degree_metadata,
         },
     )
     result.validate(fk_roles, rscm_params.max_hops, rscm_params.column_parent_cap)

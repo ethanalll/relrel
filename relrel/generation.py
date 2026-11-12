@@ -23,8 +23,8 @@ BASE_REVISION = "2a273cfd21933ee4893dfcb862a3edaed45ac665"
 class FixedMLP:
     """Keep the release's sampled weights; draw each hidden activation once.
 
-    The legacy MLP remains unchanged. Fixed functions make structural replay
-    and interventions well defined without incidental per-call activation draws.
+    Fixed functions make structural replay and interventions well defined
+    without incidental per-call activation draws.
     """
 
     def __init__(self, mlp: MLP, scm_params):
@@ -39,9 +39,9 @@ class FixedMLP:
         return x @ self.weights[-1]
 
 
-def make_projection(scm_params, info: dict, *, decoder: bool):
+def make_projection(scm_params, info: dict, *, decoder: bool, scalar_output: bool = False):
     """Adapt the original numerical/categorical projection classes."""
-    if info["_stype"] == stype.numerical:
+    if info["_stype"] == stype.numerical or scalar_output:
         mlp = MLP(
             scm_params,
             scm_params.mlp_emb_dim if decoder else scm_params.mlp_in_dim,
@@ -57,7 +57,7 @@ def make_projection(scm_params, info: dict, *, decoder: bool):
     return function
 
 
-def make_source(scm_params, info: dict, rows: int, table_type: TableType):
+def make_source(scm_params, info: dict, rows: int, table_type: TableType, *, scalar_output=False):
     """Use the release's clipped temporal processes, including entity scales."""
 
     def numerical():
@@ -84,7 +84,7 @@ def make_source(scm_params, info: dict, rows: int, table_type: TableType):
             rows, low, high, alpha, trend, np.ceil(rows * fraction), cycle, noise
         )
 
-    if info["_stype"] == stype.numerical:
+    if info["_stype"] == stype.numerical or scalar_output:
         return numerical()
     return CategoricalTSDataGenerator([numerical() for _ in info["categories"]])
 
@@ -142,6 +142,13 @@ class GlobalSCMGenerator:
         self.function_keys = {}
         self.raw_values: dict[Column, torch.Tensor] = {}
         limits = config.rscm
+        self.quantile_columns = {
+            column
+            for column in graph.columns
+            if limits.categorical_alpha_choices is not None
+            and self._info(column)["_stype"] == stype.categorical
+        }
+        self.category_calibrations = {}
         index_bytes = skeleton.nbytes
         for edge in graph.edges:
             plan = compile_grounding(skeleton, edge, limits.index_memory_bytes - index_bytes)
@@ -156,7 +163,10 @@ class GlobalSCMGenerator:
                 continue
             with scoped_rng(self._key("decoder", column.identity)):
                 self.decoders[column] = make_projection(
-                    config.scm_params, self._info(column), decoder=True
+                    config.scm_params,
+                    self._info(column),
+                    decoder=True,
+                    scalar_output=column in self.quantile_columns,
                 )
             with scoped_rng(self._key("noise-family", column.identity)):
                 self.noise_distributions[column] = (
@@ -179,13 +189,59 @@ class GlobalSCMGenerator:
                 self._info(column),
                 count,
                 self.tables[column.table].get("type", TableType.Entity),
+                scalar_output=column in self.quantile_columns,
             )
             values = [source.get_value(row) for row in range(count)]
-        dtype = torch.long if self._info(column)["_stype"] == stype.categorical else torch.float32
+        integer_output = (
+            self._info(column)["_stype"] == stype.categorical
+            and column not in self.quantile_columns
+        )
+        dtype = torch.long if integer_output else torch.float32
         stable = torch.tensor(values, dtype=dtype)
         result = torch.empty_like(stable)
         result[np.argsort(self.skeleton.row_ids[column.table], kind="stable")] = stable
         return result
+
+    def _quantile_categories(self, column, scores):
+        if not torch.isfinite(scores).all():
+            raise FloatingPointError(f"Nonfinite categorical score in {column.qualified_name}")
+        scores = scores.to(torch.float64)
+        if column not in self.category_calibrations:
+            count = len(scores)
+            categories = len(self._info(column)["categories"])
+            rng = np.random.default_rng(self._key("category-quantiles", column.identity))
+            alpha = float(rng.choice(self.config.rscm.categorical_alpha_choices))
+            proportions = rng.dirichlet(np.full(categories, alpha))
+            ranks = torch.from_numpy(np.rint(count * np.cumsum(proportions)[:-1]).astype(np.int64))
+            cutoffs = torch.zeros(categories - 1, dtype=scores.dtype)
+            if count:
+                unique, counts = torch.unique(scores, sorted=True, return_counts=True)
+                # Only place boundaries between distinct scores. For a tied rank,
+                # choose the closest attainable cumulative row count.
+                attainable = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+                upper = torch.searchsorted(attainable, ranks)
+                lower = (upper - 1).clamp_min(0)
+                boundary = torch.where(
+                    ranks - attainable[lower] <= attainable[upper] - ranks, lower, upper
+                )
+                left = unique[(boundary - 1).clamp_min(0)]
+                right = unique[boundary.clamp_max(len(unique) - 1)]
+                cutoffs = torch.where(
+                    boundary == 0,
+                    torch.nextafter(left, torch.full_like(left, -torch.inf)),
+                    (left + right) / 2,
+                )
+            labels = torch.searchsorted(cutoffs, scores)
+            self.category_calibrations[column] = {
+                "alpha": alpha,
+                "target_proportions": proportions.tolist(),
+                "cutoffs": cutoffs.tolist(),
+                "baseline_counts": torch.bincount(labels, minlength=categories).tolist(),
+                "distinct_baseline_scores": len(unique) if count else 0,
+            }
+            return labels
+        cutoffs = scores.new_tensor(self.category_calibrations[column]["cutoffs"])
+        return torch.searchsorted(cutoffs, scores)
 
     def _noise(self, column):
         count, width = self.skeleton.row_counts[column.table], self.config.scm_params.mlp_emb_dim
@@ -212,6 +268,8 @@ class GlobalSCMGenerator:
         interventions = interventions or {}
         if set(interventions) - set(self.graph.columns):
             raise ValueError("Intervention references an unknown feature column")
+        if interventions and len(self.category_calibrations) < len(self.quantile_columns):
+            self.evaluate()
         limits, width = self.config.rscm, self.config.scm_params.mlp_emb_dim
         self.raw_values = {}
         for column in self.graph.order:
@@ -249,12 +307,15 @@ class GlobalSCMGenerator:
                 dtype = (
                     torch.long
                     if self._info(column)["_stype"] == stype.categorical
+                    and column not in self.quantile_columns
                     else torch.float32
                 )
                 values = torch.empty(count, dtype=dtype)
                 for start in range(0, count, limits.batch_size):
                     stop = min(count, start + limits.batch_size)
                     values[start:stop] = self.decoders[column](latent[start:stop]).reshape(-1)
+            if column in self.quantile_columns and column not in interventions:
+                values = self._quantile_categories(column, values)
             if not torch.isfinite(values).all():
                 raise FloatingPointError(f"Nonfinite RSCM output in {column.qualified_name}")
             self.raw_values[column] = values
@@ -270,7 +331,6 @@ class GlobalSCMGenerator:
             for column in self.graph.columns:
                 if column.table == name:
                     values = self.raw_values[column].cpu().numpy()
-                    # v1 postprocessing identifies numerical/categorical columns by dtype.
                     frame[column.name] = values.astype(
                         np.int64
                         if self._info(column)["_stype"] == stype.categorical
@@ -308,6 +368,16 @@ class GlobalSCMGenerator:
             "config_fingerprint": config_fingerprint(self.config.scm_params),
             "function_keys": self.function_keys,
             "mechanisms": "v1 MLPs and categorical embeddings with frozen hidden activations",
-            "causal_values": "before v1 missingness and categorical export postprocessing",
+            "causal_values": "before missingness and category label formatting",
+            **(
+                {
+                    "categorical_calibration": {
+                        column.qualified_name: calibration
+                        for column, calibration in self.category_calibrations.items()
+                    }
+                }
+                if self.config.rscm.categorical_alpha_choices is not None
+                else {}
+            ),
             "temporal_policy": "static tables; source processes may vary with row index",
         }

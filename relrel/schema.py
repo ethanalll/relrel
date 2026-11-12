@@ -60,6 +60,11 @@ class RandomSchemaGraphBuilder:
             num_nodes=self.num_tables, dag_params=self.config.dag_params, seed=self.seed
         )
         G = dag.graph
+        cap = self.config.rscm.max_foreign_keys
+        if cap is not None:
+            for table_id in G.nodes:
+                parents = sorted(G.predecessors(table_id))
+                G.remove_edges_from((parent, table_id) for parent in parents[cap:])
 
         for table_id in G.nodes:
             G.nodes[table_id]["name"] = f"table_{table_id}"

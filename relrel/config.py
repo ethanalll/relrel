@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -98,7 +99,6 @@ class SCMParams:
             "Layered",
         ],
     )
-    scm_col_node_perc_choices: Choices = Choices(kind="range", value=[0.3, 0.9])
     num_categories_choices: Choices = Choices(kind="range", value=[2, 10])
     col_stype_choices: Choices = Choices(kind="set", value=[stype.categorical, stype.numerical])
     initialization_choices: Choices = Choices(
@@ -173,7 +173,30 @@ class RSCMParams:
     temp_memory_bytes: int = 256 * 1024**2
     parent_map_memory_bytes: int = 256 * 1024**2
 
+    categorical_alpha_choices: tuple[float, ...] | None = None
+    column_degree_choices: tuple[float, ...] | None = None
+    max_foreign_keys: int | None = None
+
     def __post_init__(self):
+        if self.max_foreign_keys is not None and (
+            type(self.max_foreign_keys) is not int or self.max_foreign_keys < 1
+        ):
+            raise ValueError("max_foreign_keys must be a positive integer")
+        for name, allow_zero in (
+            ("categorical_alpha_choices", False),
+            ("column_degree_choices", True),
+        ):
+            choices = getattr(self, name)
+            if choices is None:
+                continue
+            if not choices or any(
+                isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and not allow_zero)
+                for value in choices
+            ):
+                raise ValueError(f"Invalid prior choices for {name}")
         if type(self.max_hops) is not int or self.max_hops not in (1, 2):
             raise ValueError("max_hops must be 1 or 2")
         for name, minimum in (
@@ -215,9 +238,9 @@ class Config:
     test_split: float = 0.9
     cache_dir: str | None = None
     schema_file: str | None = None
-    generation_mode: str = "legacy_scm"
+    generation_mode: Literal["global_rscm"] = "global_rscm"
     rscm: RSCMParams = field(default_factory=RSCMParams)
 
     def __post_init__(self):
-        if self.generation_mode not in ("legacy_scm", "global_rscm"):
-            raise ValueError("generation_mode must be 'legacy_scm' or 'global_rscm'")
+        if self.generation_mode != "global_rscm":
+            raise ValueError("generation_mode must be 'global_rscm'")
