@@ -52,3 +52,44 @@ pixi run pytest
 
 Based on [PluRel](https://github.com/stanford-star/plurel), release v1.0.0.
 See [LICENSE](LICENSE) for the license and original copyright notice.
+
+## RT ablations
+
+Use `make synthesize` and `make export` from this repo. Set `DATA` to the same
+absolute path in RelRel and RT. The default is `~/scratch/relrel-rt`.
+
+```sh
+pixi install
+export DATA=/shared/scratch/relrel-rt
+make synthesize SUITE=factorial COUNT=128 WORKERS=8
+make export SUITE=factorial
+make synthesize SUITE=sampler COUNT=128 WORKERS=8
+make export SUITE=sampler
+make synthesize SUITE=holdout SPLIT=val COUNT=16 WORKERS=8
+make export SUITE=holdout SPLIT=val
+```
+
+- **Factorial** has four arms combining per-table SCMs or global RSCM with
+  original categorical decoding or eager quantile decoding.
+- **Sampler** has two global-RSCM arms with eager quantiles. For each seed, the
+  direct sampler matches the original graph-family sampler's realized edge
+  count. Pairs that cannot meet the budget are recorded and replaced.
+- **Holdout** creates one reference corpus using a mixture of the four factorial
+  settings and starting from a separate seed range.
+
+Each accepted pair or quartet shares the schema, FK skeleton, feature
+inventory, missingness draws, and eligible RT targets. Both generator arms
+produce static tables. The per-table SCM retains latent nodes and dense
+forward-FK inputs, while the global SCM uses its column-level edges. The
+factorial therefore measures the effect of switching between these generator
+pipelines. Both quantile arms discretize each categorical column before its
+descendants read it.
+
+Raw tables and causal diagnostics go in `DATA/synthetic/raw/<suite>/<split>/`.
+Model-ready tables and the training target manifest go in
+`DATA/synthetic/rt/<suite>/<split>/<arm>/`. The export represents multicategory
+features as text contexts and preserves Boolean and numerical training targets.
+Run preprocessing and training from the RT repo using its `EXPERIMENTS.md`.
+
+For a smoke test, use a separate `DATA` root and pass `TINY=1 COUNT=4` to
+`make synthesize`. `make help` lists the available overrides.

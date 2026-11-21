@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -173,7 +174,32 @@ class RSCMParams:
     temp_memory_bytes: int = 256 * 1024**2
     parent_map_memory_bytes: int = 256 * 1024**2
 
+    categorical_alpha_choices: tuple[float, ...] | None = None
+    column_degree_choices: tuple[float, ...] | None = None
+    column_edge_budget: int | None = None
+
     def __post_init__(self):
+        for name, allow_zero in (
+            ("categorical_alpha_choices", False),
+            ("column_degree_choices", True),
+        ):
+            choices = getattr(self, name)
+            if choices is not None and (
+                not choices
+                or any(
+                    isinstance(value, bool)
+                    or not math.isfinite(value)
+                    or value < 0
+                    or (value == 0 and not allow_zero)
+                    for value in choices
+                )
+            ):
+                raise ValueError(f"Invalid prior choices for {name}")
+        if self.column_edge_budget is not None:
+            if type(self.column_edge_budget) is not int or self.column_edge_budget < 0:
+                raise ValueError("column_edge_budget must be a nonnegative integer")
+            if self.column_degree_choices is not None:
+                raise ValueError("Provide either a degree prior or an exact edge budget")
         if type(self.max_hops) is not int or self.max_hops not in (1, 2):
             raise ValueError("max_hops must be 1 or 2")
         for name, minimum in (

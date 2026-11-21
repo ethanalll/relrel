@@ -300,7 +300,7 @@ class SyntheticDataset(Dataset):
 
         return Database(table_dict)
 
-    def _make_global_db(self) -> Database:
+    def _prepare_global_schema(self):
         with scoped_rng(keyed_seed(self.seed, "schema")):
             num_tables = self.config.database_params.num_tables_choices.sample_uniform()
             self.table_relationships = self.configure_table_relationships(
@@ -317,6 +317,10 @@ class SyntheticDataset(Dataset):
                     name += "_"
                 info["pkey_col"] = name
                 info["columns"][name] = {"_stype": stype.categorical, "categories": None}
+        return tables
+
+    def _make_global_db(self) -> Database:
+        tables = self._prepare_global_schema()
         columns = [
             Column(name, col)
             for name, info in sorted(tables.items())
