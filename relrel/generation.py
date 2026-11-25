@@ -1,7 +1,7 @@
 """Evaluate a relational SCM in global feature-column order, using v1 factories."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,10 @@ from relrel.utils import MLP, CategoricalDecoder, CategoricalEncoder, TableType
 
 GENERATOR_VERSION = "v1.0.0-global-rscm-v1"
 BASE_REVISION = "2a273cfd21933ee4893dfcb862a3edaed45ac665"
+
+
+def mechanism_seed(seed, kind, identity):
+    return keyed_seed(seed, GENERATOR_VERSION, kind, identity)
 
 
 class FixedMLP:
@@ -122,6 +126,21 @@ def calibrate_quantiles(scores, categories, alpha_choices, rng):
     }
 
 
+@dataclass(frozen=True)
+class CategoricalDecoding:
+    """Select the original categorical mechanism or eager quantile decoding."""
+
+    alpha_choices: tuple[float, ...] | None = None
+
+    def uses_quantiles(self, feature):
+        return self.alpha_choices is not None and feature["_stype"] == stype.categorical
+
+    def calibrate(self, scores, categories, rng):
+        if self.alpha_choices is None:
+            raise ValueError("Quantile calibration requires a categorical prior")
+        return calibrate_quantiles(scores, categories, self.alpha_choices, rng)
+
+
 class GlobalSCMGenerator:
     """One shared mechanism per column; FK paths select row-level inputs.
 
@@ -175,11 +194,9 @@ class GlobalSCMGenerator:
         self.function_keys = {}
         self.raw_values: dict[Column, torch.Tensor] = {}
         limits = config.rscm
+        self.decoding = CategoricalDecoding(limits.categorical_alpha_choices)
         self.quantile_columns = {
-            column
-            for column in graph.columns
-            if limits.categorical_alpha_choices is not None
-            and self._info(column)["_stype"] == stype.categorical
+            column for column in graph.columns if self.decoding.uses_quantiles(self._info(column))
         }
         self.category_calibrations = {}
         index_bytes = skeleton.nbytes
@@ -210,7 +227,7 @@ class GlobalSCMGenerator:
         return self.tables[column.table]["columns"][column.name]
 
     def _key(self, kind, identity):
-        key = keyed_seed(self.seed, GENERATOR_VERSION, kind, identity)
+        key = mechanism_seed(self.seed, kind, identity)
         self.function_keys[f"{kind}:{identity!r}"] = key
         return key
 
@@ -239,11 +256,8 @@ class GlobalSCMGenerator:
         scores = scores.to(torch.float64)
         if column not in self.category_calibrations:
             rng = np.random.default_rng(self._key("category-quantiles", column.identity))
-            labels, calibration = calibrate_quantiles(
-                scores,
-                len(self._info(column)["categories"]),
-                self.config.rscm.categorical_alpha_choices,
-                rng,
+            labels, calibration = self.decoding.calibrate(
+                scores, len(self._info(column)["categories"]), rng
             )
             self.category_calibrations[column] = calibration
             return labels

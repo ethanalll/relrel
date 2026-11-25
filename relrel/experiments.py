@@ -6,12 +6,12 @@ import json
 import subprocess
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import repeat
 from multiprocessing import get_context
 from pathlib import Path
+from typing import Literal
 
-import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
@@ -20,29 +20,42 @@ from torch_frame import stype
 
 from relrel.config import Choices, Config, DatabaseParams
 from relrel.dataset import SyntheticDataset
-from relrel.generation import (
-    FixedMLP,
-    GlobalSCMGenerator,
-    calibrate_quantiles,
-    make_projection,
-    make_source,
-)
-from relrel.rng import canonical_json, keyed_seed, scoped_rng
+from relrel.generation import CategoricalDecoding, GlobalSCMGenerator
+from relrel.local_generation import features, local_frames
+from relrel.rng import canonical_json, config_fingerprint, keyed_seed, scoped_rng
 from relrel.rscm import Column, sample_column_graph
-from relrel.scm import SCM
 from relrel.skeleton import Skeleton
-from relrel.utils import MLP
+from relrel.utils import TableType
+
+
+@dataclass(frozen=True)
+class Arm:
+    dag: Literal["local", "global"]
+    decoding: CategoricalDecoding
+    match_family_edges: bool = False
+
+
+ORIGINAL = CategoricalDecoding()
+QUANTILE = CategoricalDecoding((1.0, 5.0))
+GENERATION_PROFILE = "paired-activity-dates-v1"
+REFERENCE_REVISIONS = {
+    "plurel": "2a273cfd21933ee4893dfcb862a3edaed45ac665",
+    "relrel": "40cca23880063cb0d74829ef387e01a028600563",
+}
 
 FACTORIAL = {
-    "local-original": (False, False, False),
-    "local-quantile": (False, True, False),
-    "global-original": (True, False, False),
-    "global-quantile": (True, True, False),
+    "local-original": Arm("local", ORIGINAL),
+    "local-quantile": Arm("local", QUANTILE),
+    "global-original": Arm("global", ORIGINAL),
+    "global-quantile": Arm("global", QUANTILE),
 }
 SUITES = {
     "factorial": FACTORIAL,
-    "sampler": {"family": (True, True, False), "direct": (True, True, True)},
-    "holdout": {"reference": (None, None, False)},
+    "sampler": {
+        "family": FACTORIAL["global-quantile"],
+        "direct": replace(FACTORIAL["global-quantile"], match_family_edges=True),
+    },
+    "holdout": {"reference": FACTORIAL["local-original"]},
 }
 
 
@@ -50,118 +63,24 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
-def features(info):
-    return {
-        name: spec
-        for name, spec in info["columns"].items()
-        if name != info["pkey_col"] and name not in info["fkey_col_to_pkey_table"]
-    }
-
-
-def fixed_projection(projection, params):
-    if isinstance(projection, MLP):
-        return FixedMLP(projection, params)
-    projection.mlp = FixedMLP(projection.mlp, params)
-    return projection
-
-
-def local_frames(dataset, tables, skeleton, alpha_choices):
-    """Evaluate per-table SCMs eagerly, with their original dense FK inputs."""
-    seed, params = dataset.seed, dataset.config.scm_params
-    scms, frames, diagnostics = {}, {}, {}
-    for table_id in nx.topological_sort(dataset.table_relationships):
-        info = dataset.table_relationships.nodes[table_id]
-        name = info["name"]
-        columns = features(info)
-        fk_tables = info["fkey_col_to_pkey_table"]
-        children = [
-            dataset.table_relationships.nodes[child]["name"]
-            for child in sorted(dataset.table_relationships.successors(table_id))
-        ]
-        n = skeleton.row_counts[name]
-        with scoped_rng(keyed_seed(seed, "local-scm", name)):
-            scm = SCM(
-                name,
-                children,
-                columns,
-                info["pkey_col"],
-                fk_tables,
-                {parent: scms[parent] for parent in fk_tables.values()},
-                params,
-                dataset.config.dag_params,
+def table_controls(dataset, tables, skeleton):
+    """Prepare dates and missingness once, before evaluating any arm."""
+    timestamps, missing = {}, {}
+    for name, info in sorted(tables.items()):
+        count = skeleton.row_counts[name]
+        if info["type"] == TableType.Activity:
+            timestamps[name] = pd.date_range(
+                start=dataset.min_timestamp, end=dataset.max_timestamp, periods=count
             )
-        graph = scm.dag.graph
-        with scoped_rng(keyed_seed(seed, "local-activations", name)):
-            for _, attrs in graph.nodes(data=True):
-                attrs["decoder"] = fixed_projection(attrs["decoder"], params)
-                for key, encoder in attrs.get("collation_encoders", {}).items():
-                    attrs["collation_encoders"][key] = fixed_projection(encoder, params)
-            for _, _, attrs in graph.edges(data=True):
-                attrs["encoder"] = fixed_projection(attrs["encoder"], params)
-
-        frame = pd.DataFrame({info["pkey_col"]: np.arange(n, dtype=np.int64)})
-        foreign_input = torch.zeros((n, params.mlp_emb_dim))
-        for role in skeleton.roles:
-            if role.child_table != name:
-                continue
-            parent = role.parent_table
-            offsets = skeleton.forward(role)
-            frame[role.name] = pd.array(np.where(offsets >= 0, offsets, None), dtype="Int64")
-            present = offsets >= 0
-            parent_scm = scms[parent]
-            parent_cols = features(tables[parent])
-            for node in parent_scm.col_nodes:
-                attrs = parent_scm.dag.graph.nodes[node]
-                column = attrs["col_name"]
-                encoder = attrs["collation_encoders"][(parent, name)]
-                values = torch.from_numpy(frames[parent][column].to_numpy(copy=True))
-                if parent_cols[column]["_stype"] == stype.numerical:
-                    values = values.float().reshape(-1, 1)
-                foreign_input[present] += encoder(values[offsets[present]]) / len(parent_cols)
-
-        values, calibrations = {}, {}
-        for node in nx.topological_sort(graph):
-            attrs = graph.nodes[node]
-            numerical = attrs["_stype"] == stype.numerical
-            quantile = not numerical and alpha_choices is not None
-            kind = {"_stype": attrs["_stype"], "categories": None}
-            if not numerical:
-                kind["categories"] = range(attrs["num_categories"])
-            with scoped_rng(keyed_seed(seed, "local-mechanism", name, int(node))):
-                if graph.in_degree(node) == 0:
-                    source = make_source(params, kind, n, info["type"], scalar_output=quantile)
-                    value = torch.tensor(
-                        [source.get_value(row) for row in range(n)],
-                        dtype=torch.float32 if numerical or quantile else torch.long,
+        missing[name] = {}
+        for column, spec in sorted(features(info).items()):
+            if spec["_stype"] == stype.numerical:
+                with scoped_rng(keyed_seed(dataset.seed, "experiment-missingness", name, column)):
+                    share = dataset.config.database_params.column_nan_perc.sample_uniform()
+                    missing[name][column] = np.random.choice(
+                        count, int(share * count), replace=False
                     )
-                else:
-                    noise = attrs["noise_dist"].sample((n, params.mlp_emb_dim)).reshape(n, -1)
-                    latent = foreign_input + noise / params.mlp_emb_dim
-                    for parent in graph.predecessors(node):
-                        edge = graph.edges[parent, node]
-                        latent += edge["weight"] * edge["encoder"](values[parent])
-                    decoder = (
-                        make_projection(params, kind, decoder=True, scalar_output=True)
-                        if quantile
-                        else attrs["decoder"]
-                    )
-                    value = decoder(latent).reshape(-1)
-            if quantile:
-                rng = np.random.default_rng(keyed_seed(seed, "local-quantiles", name, int(node)))
-                value, calibration = calibrate_quantiles(
-                    value, attrs["num_categories"], alpha_choices, rng
-                )
-                calibrations[attrs.get("col_name", f"latent:{node}")] = calibration
-            if not torch.isfinite(value).all():
-                raise ValueError(f"Nonfinite feature in {name}, node {node}")
-            values[node] = value.reshape(n, 1) if numerical else value
-            if node in scm.col_nodes:
-                frame[attrs["col_name"]] = value.numpy()
-
-        scm.df = frame
-        scms[name], frames[name] = scm, frame
-        diagnostics[name] = {"local_edges": graph.number_of_edges(), "quantiles": calibrations}
-    return frames, {"local_scm": diagnostics}
+    return timestamps, missing
 
 
 def make_case(seed, suite, tiny, output):
@@ -177,6 +96,7 @@ def generate_case(seed, suite, tiny, stage, output):
     if any(len(t["fkey_col_to_pkey_table"]) > 5 for t in tables.values()):
         return {"seed": seed, "rejected": "more than five FKs in a table"}
     skeleton = Skeleton.from_schema(tables, config, seed)
+    timestamps, missing = table_controls(dataset, tables, skeleton)
     columns = [
         Column(table, col)
         for table, info in sorted(tables.items())
@@ -186,16 +106,18 @@ def generate_case(seed, suite, tiny, stage, output):
         columns, skeleton.roles, config.scm_params, config.dag_params, config.rscm, seed
     )
     arms = SUITES[suite]
+    if suite == "holdout":
+        dag = "global" if seed % 2 else "local"
+        decoder = "quantile" if (seed // 2) % 2 else "original"
+        arms = {"reference": FACTORIAL[f"{dag}-{decoder}"]}
     db_id = f"db-{seed:08d}"
-    case = {"seed": seed, "id": db_id, "arms": {}}
-    for arm, (global_dag, quantile, direct) in arms.items():
-        if suite == "holdout":
-            global_dag = bool(seed % 2)
-            quantile = bool((seed // 2) % 2)
-        alpha = (1.0, 5.0) if quantile else None
+    case = {"seed": seed, "id": db_id, "skeleton_sha256": skeleton.fingerprint, "arms": {}}
+    for arm, settings in arms.items():
+        global_dag = settings.dag == "global"
+        direct = settings.match_family_edges
         params = replace(
             config.rscm,
-            categorical_alpha_choices=alpha,
+            categorical_alpha_choices=settings.decoding.alpha_choices,
             column_edge_budget=len(family.edges) if direct else None,
         )
         if global_dag:
@@ -218,7 +140,7 @@ def generate_case(seed, suite, tiny, stage, output):
             causal = generator.sidecar()
             edge_count = len(graph.edges)
         else:
-            frames, causal = local_frames(dataset, tables, skeleton, alpha)
+            frames, causal = local_frames(dataset, tables, skeleton, settings.decoding)
             edge_count = None
 
         database, task_list, categorical_context, constants = {}, [], {}, 0
@@ -240,19 +162,23 @@ def generate_case(seed, suite, tiny, stage, output):
                         categorical_context.setdefault(name, []).append(col)
                     constants += int(values.nunique() < 2)
                 else:
-                    with scoped_rng(keyed_seed(seed, "experiment-missingness", name, col)):
-                        share = config.database_params.column_nan_perc.sample_uniform()
-                        absent = np.random.choice(
-                            len(frame), int(share * len(frame)), replace=False
-                        )
-                    frame.loc[absent, col] = np.nan
+                    frame[col] = values.astype(np.float64)
+                    frame.loc[missing[name][col], col] = np.nan
                     kind = "reg"
                 if kind and frame[col].nunique(dropna=True) > 1:
                     task_list.append([db_id, name, col, [], kind])
             # Ensure PK-only rows still get physical identities in the paper preprocessor.
             if not frame[list(features(info))].notna().any(axis=1).all():
                 frame["_rt_row"] = f"row of {name}"
-            database[name] = Table(df=frame, pkey_col=pk, fkey_col_to_pkey_table=fks, time_col=None)
+            time_col = None
+            if name in timestamps:
+                time_col = "date"
+                frame[time_col] = timestamps[name]
+            ordered = [pk, *sorted(fks), *sorted(features(info))]
+            ordered.extend(col for col in frame if col not in ordered)
+            database[name] = Table(
+                df=frame[ordered], pkey_col=pk, fkey_col_to_pkey_table=fks, time_col=time_col
+            )
         if not task_list:
             return {"seed": seed, "rejected": f"no varying numeric or Boolean targets in {arm}"}
         dest = stage / arm / db_id
@@ -261,7 +187,7 @@ def generate_case(seed, suite, tiny, stage, output):
         write_json(dest / "causal.json", causal)
         case["arms"][arm] = {
             "global_dag": global_dag,
-            "quantiles": quantile,
+            "quantiles": settings.decoding.alpha_choices is not None,
             "sampler": ("direct" if direct else "family") if global_dag else None,
             "edges": edge_count,
             "requested_edges": len(family.edges) if direct else None,
@@ -292,6 +218,66 @@ def experiment_config(tiny):
             num_rows_activity_table_choices=Choices("set", [24]),
         )
     return Config(database_params=prior, generation_mode="global_rscm")
+
+
+class RelRelReference(SyntheticDataset):
+    """Use the standalone RelRel revision's categorical export policy."""
+
+    def generation_identity(self):
+        identity = super().generation_identity()
+        identity.pop("fingerprint")
+        identity["categorical_export_version"] = 2
+        return {**identity, "fingerprint": config_fingerprint(identity)}
+
+    def process_categorical_data(self, frame, feature_columns, pkey_col, fkey_cols):
+        for column, info in feature_columns.items():
+            if info["_stype"] != stype.categorical:
+                continue
+            categories = info["categories"]
+            if categories == [0, 1]:
+                frame[column] = frame[column].astype(bool)
+            elif isinstance(categories[0], str):
+                frame[column] = frame[column].map(lambda index: categories[index])
+        return frame
+
+
+def generate_reference(root, reference, count, seed, tiny):
+    """Run the standalone generator with its own corpus policy."""
+    output = root / "synthetic/reference" / reference
+    if output.exists():
+        raise FileExistsError(f"{output} already exists. Use a fresh DATA path.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    config = experiment_config(tiny)
+    if reference == "plurel":
+        config = replace(config, generation_mode="legacy_scm")
+        dataset_cls = SyntheticDataset
+    else:
+        config = replace(
+            config, rscm=replace(config.rscm, categorical_alpha_choices=QUANTILE.alpha_choices)
+        )
+        dataset_cls = RelRelReference
+    with tempfile.TemporaryDirectory(dir=output.parent) as temp:
+        stage = Path(temp) / "data"
+        stage.mkdir()
+        databases = []
+        for offset in range(seed, seed + count):
+            name = f"db-{offset:08d}"
+            cache = stage / name
+            dataset = dataset_cls(offset, replace(config, cache_dir=str(cache)))
+            dataset.get_db(upto_test_timestamp=False)
+            databases.append({"id": name, "seed": offset})
+        write_json(
+            stage / "corpus.json",
+            {
+                "version": 1,
+                "reference": reference,
+                "reference_revision": REFERENCE_REVISIONS[reference],
+                "config": json.loads(canonical_json(config)),
+                "databases": databases,
+            },
+        )
+        stage.rename(output)
+    print(output)
 
 
 def configure_worker():
@@ -345,6 +331,7 @@ def synthesize(root, suite, split, count, seed, workers, tiny):
             "split": split,
             "count": count,
             "seed_start": seed,
+            "generation_profile": GENERATION_PROFILE,
             "revision": revision,
             "source_sha256": source.hexdigest(),
             "config": json.loads(canonical_json(config)),
@@ -388,6 +375,7 @@ def export(root, suite, split):
                     "suite": suite,
                     "split": split,
                     "arm": arm,
+                    "generation_profile": manifest.get("generation_profile", "legacy-static"),
                     "generation_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                     "databases": entries,
                     "tasks": tasks,
@@ -399,18 +387,30 @@ def export(root, suite, split):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("synthesize", "export"))
+    parser.add_argument("command", choices=("synthesize", "export", "reference"))
     parser.add_argument("--data-root", required=True, type=Path)
-    parser.add_argument("--suite", required=True, choices=SUITES)
-    parser.add_argument("--split", required=True, choices=("train", "val"))
+    parser.add_argument("--suite", choices=SUITES)
+    parser.add_argument("--split", choices=("train", "val"))
+    parser.add_argument("--reference", choices=REFERENCE_REVISIONS)
     parser.add_argument("--count", type=int)
     parser.add_argument("--seed-start", type=int)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--tiny", action="store_true")
     args = parser.parse_args()
+    root = args.data_root.expanduser().resolve()
+    if args.command == "reference":
+        if args.reference is None:
+            parser.error("Choose --reference for standalone generation")
+        count = args.count if args.count is not None else 1
+        seed = args.seed_start if args.seed_start is not None else 0
+        if count < 1 or seed < 0 or seed + count > 2**32:
+            parser.error("Invalid reference count or seed range")
+        generate_reference(root, args.reference, count, seed, args.tiny)
+        return
+    if args.suite is None or args.split is None:
+        parser.error("Choose --suite and --split for the paired corpus")
     if (args.suite == "holdout") != (args.split == "val"):
         parser.error("Use holdout with val and factorial/sampler with train")
-    root = args.data_root.expanduser().resolve()
     if args.command == "synthesize":
         count = args.count if args.count is not None else (16 if args.split == "val" else 128)
         seed = (

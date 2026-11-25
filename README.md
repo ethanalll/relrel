@@ -77,13 +77,33 @@ make export SUITE=holdout SPLIT=val
 - **Holdout** creates one reference corpus using a mixture of the four factorial
   settings and starting from a separate seed range.
 
-Each accepted pair or quartet shares the schema, FK skeleton, feature
-inventory, missingness draws, and eligible RT targets. Both generator arms
-produce static tables. The per-table SCM retains latent nodes and dense
-forward-FK inputs, while the global SCM uses its column-level edges. The
-factorial therefore measures the effect of switching between these generator
-pipelines. Both quantile arms discretize each categorical column before its
-descendants read it.
+Each accepted pair or quartet shares the schema, FK skeleton, feature inventory,
+activity dates, missingness draws, and eligible RT targets. The table schema uses
+the three original schema families. Local SCMs draw independently per table
+from the five original SCM families. The global SCM draws one database-wide
+proposal from those same five families and filters edges by FK reachability.
+The per-table SCM retains latent nodes and dense forward-FK inputs. Both
+quantile arms discretize each categorical column before descendants read it.
+
+Use a fresh `DATA` root for the dated paired corpora. Their manifests record the
+`paired-activity-dates-v1` generation profile. For exact historical references,
+use the [original PluRel v1.0.0 generator](https://github.com/stanford-star/plurel/tree/2a273cfd21933ee4893dfcb862a3edaed45ac665)
+and the [RelRel 40cca23 generator](https://github.com/ethanalll/relrel/tree/40cca23880063cb0d74829ef387e01a028600563).
+The original PluRel release generates dated activity tables and samples MLP
+activations per call. RelRel 40cca23 exports timestamp-free tables and fixes
+MLP activations. It also retains multiclass categorical values. The paired
+factorial uses dates, fixed activations, and a common export policy across all
+four arms. To generate the two standalone references under the same `DATA` root:
+
+```sh
+make reference REFERENCE=plurel COUNT=4 SEED_START=10000
+make reference REFERENCE=relrel COUNT=4 SEED_START=10000
+```
+
+These commands write to `DATA/synthetic/reference/<reference>/`. The RelRel
+reference uses quantile decoding with the five-family prior. For the PluRel
+Table 1 comparison, use the
+[released synthetic-only checkpoint](https://huggingface.co/stanford-star/rt-plurel/blob/main/paper/synthetic-pretrain_rdb_1024_size_4b.pt).
 
 Raw tables and causal diagnostics go in `DATA/synthetic/raw/<suite>/<split>/`.
 Model-ready tables and the training target manifest go in
