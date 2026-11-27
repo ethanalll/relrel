@@ -43,7 +43,14 @@ class FixedMLP:
         return x @ self.weights[-1]
 
 
-def make_projection(scm_params, info: dict, *, decoder: bool, scalar_output: bool = False):
+def make_projection(
+    scm_params,
+    info: dict,
+    *,
+    decoder: bool,
+    scalar_output: bool = False,
+    fixed_mlp: bool = True,
+):
     """Adapt the original numerical/categorical projection classes."""
     if info["_stype"] == stype.numerical or scalar_output:
         mlp = MLP(
@@ -52,12 +59,13 @@ def make_projection(scm_params, info: dict, *, decoder: bool, scalar_output: boo
             scm_params.mlp_emb_dim,
             scm_params.mlp_out_dim if decoder else scm_params.mlp_emb_dim,
         )
-        return FixedMLP(mlp, scm_params)
+        return FixedMLP(mlp, scm_params) if fixed_mlp else mlp
     if info["_stype"] != stype.categorical or not info.get("categories"):
         raise ValueError("RSCM features must be numerical or have an explicit category inventory")
     cls = CategoricalDecoder if decoder else CategoricalEncoder
     function = cls(scm_params, len(info["categories"]), scm_params.mlp_emb_dim)
-    function.mlp = FixedMLP(function.mlp, scm_params)
+    if fixed_mlp:
+        function.mlp = FixedMLP(function.mlp, scm_params)
     return function
 
 
@@ -199,6 +207,7 @@ class GlobalSCMGenerator:
             column for column in graph.columns if self.decoding.uses_quantiles(self._info(column))
         }
         self.category_calibrations = {}
+        self.fixed_mlp = True if config.fixed_mlp is None else bool(config.fixed_mlp)
         index_bytes = skeleton.nbytes
         for edge in graph.edges:
             plan = compile_grounding(skeleton, edge, limits.index_memory_bytes - index_bytes)
@@ -206,7 +215,10 @@ class GlobalSCMGenerator:
             index_bytes += plan.nbytes
             with scoped_rng(self._key("encoder", edge.identity)):
                 self.encoders[edge.identity] = make_projection(
-                    config.scm_params, self._info(edge.source), decoder=False
+                    config.scm_params,
+                    self._info(edge.source),
+                    decoder=False,
+                    fixed_mlp=self.fixed_mlp,
                 )
         for column in graph.columns:
             if not graph.incoming(column):
@@ -217,6 +229,7 @@ class GlobalSCMGenerator:
                     self._info(column),
                     decoder=True,
                     scalar_output=column in self.quantile_columns,
+                    fixed_mlp=self.fixed_mlp,
                 )
             with scoped_rng(self._key("noise-family", column.identity)):
                 self.noise_distributions[column] = (
@@ -313,7 +326,11 @@ class GlobalSCMGenerator:
                     )
                     if self._info(edge.source)["_stype"] == stype.numerical:
                         source = source.unsqueeze(-1)
-                    encoded = self.encoders[edge.identity](source)
+                    if self.fixed_mlp:
+                        encoded = self.encoders[edge.identity](source)
+                    else:
+                        with scoped_rng(self._key("eval-encoder", edge.identity)):
+                            encoded = self.encoders[edge.identity](source)
                     pool = self.plans[edge.identity].prepare_pool(
                         encoded,
                         policy=limits.parent_policy,
@@ -334,9 +351,17 @@ class GlobalSCMGenerator:
                     else torch.float32
                 )
                 values = torch.empty(count, dtype=dtype)
-                for start in range(0, count, limits.batch_size):
-                    stop = min(count, start + limits.batch_size)
-                    values[start:stop] = self.decoders[column](latent[start:stop]).reshape(-1)
+                if self.fixed_mlp:
+                    for start in range(0, count, limits.batch_size):
+                        stop = min(count, start + limits.batch_size)
+                        values[start:stop] = self.decoders[column](latent[start:stop]).reshape(-1)
+                else:
+                    with scoped_rng(self._key("eval-decoder", column.identity)):
+                        for start in range(0, count, limits.batch_size):
+                            stop = min(count, start + limits.batch_size)
+                            values[start:stop] = self.decoders[column](latent[start:stop]).reshape(
+                                -1
+                            )
             if column in self.quantile_columns and column not in interventions:
                 values = self._quantile_categories(column, values)
             if not torch.isfinite(values).all():
@@ -390,7 +415,11 @@ class GlobalSCMGenerator:
             },
             "config_fingerprint": config_fingerprint(self.config.scm_params),
             "function_keys": self.function_keys,
-            "mechanisms": "v1 MLPs and categorical embeddings with frozen hidden activations",
+            "mechanisms": (
+                "v1 MLPs and categorical embeddings with frozen hidden activations"
+                if self.fixed_mlp
+                else "v1 MLPs and categorical embeddings with per-call hidden activations"
+            ),
             "causal_values": "before missingness and category label formatting",
             **(
                 {
@@ -402,5 +431,9 @@ class GlobalSCMGenerator:
                 if self.config.rscm.categorical_alpha_choices is not None
                 else {}
             ),
-            "temporal_policy": "static tables; source processes may vary with row index",
+            "temporal_policy": (
+                "activity tables dated across [min_timestamp, max_timestamp]; entity tables static"
+                if self.config.include_activity_dates
+                else "static tables; source processes may vary with row index"
+            ),
         }

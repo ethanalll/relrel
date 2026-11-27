@@ -13,6 +13,8 @@ from tqdm import tqdm
 
 from relrel.config import DAGParams, SCMParams
 from relrel.dag import DAG_REGISTRY
+from relrel.generation import FixedMLP, calibrate_quantiles
+from relrel.rng import keyed_seed
 from relrel.ts import CategoricalTSDataGenerator, TSDataGenerator
 from relrel.utils import (
     MLP,
@@ -36,6 +38,10 @@ class SCM:
         scm_params: SCMParams,
         dag_params: DAGParams,
         seed: int | None = None,
+        *,
+        categorical_alpha_choices: tuple[float, ...] | None = None,
+        fixed_mlp: bool = False,
+        quantile_seed: int | None = None,
     ):
         self.table_name = table_name
         self.child_table_names = child_table_names
@@ -47,6 +53,10 @@ class SCM:
         self.scm_params = scm_params
         self.dag_params = dag_params
         self.seed = seed
+        self.categorical_alpha_choices = categorical_alpha_choices
+        self.fixed_mlp = fixed_mlp
+        self.quantile_seed = quantile_seed
+        self.category_calibrations: dict[str, dict] = {}
         if self.seed:
             set_random_seed(self.seed)
 
@@ -102,17 +112,25 @@ class SCM:
             out_dim=self.scm_params.mlp_out_dim,
         )
 
+    def _maybe_fix(self, projection):
+        if not self.fixed_mlp:
+            return projection
+        if isinstance(projection, MLP):
+            return FixedMLP(projection, self.scm_params)
+        projection.mlp = FixedMLP(projection.mlp, self.scm_params)
+        return projection
+
     def get_encoder(self, _stype: stype, num_categories: int | None):
         if _stype == stype.numerical:
-            return self._get_numerical_encoder()
+            return self._maybe_fix(self._get_numerical_encoder())
         elif _stype == stype.categorical:
-            return self._get_categorical_encoder(num_categories=num_categories)
+            return self._maybe_fix(self._get_categorical_encoder(num_categories=num_categories))
 
     def get_decoder(self, _stype: stype, num_categories: int | None):
-        if _stype == stype.numerical:
-            return self._get_numerical_decoder()
+        if _stype == stype.numerical or self.categorical_alpha_choices is not None:
+            return self._maybe_fix(self._get_numerical_decoder())
         elif _stype == stype.categorical:
-            return self._get_categorical_decoder(num_categories=num_categories)
+            return self._maybe_fix(self._get_categorical_decoder(num_categories=num_categories))
 
     def _get_ts_data_gen(self, num_rows: int, table_type: TableType):
         num_points = num_rows
@@ -149,7 +167,7 @@ class SCM:
         self.source_node_to_ts_data_gen = {}
         for node in self.source_nodes:
             _stype = self.dag.graph.nodes[node]["_stype"]
-            if _stype == stype.numerical:
+            if _stype == stype.numerical or self.categorical_alpha_choices is not None:
                 self.source_node_to_ts_data_gen[node] = self._get_ts_data_gen(
                     num_rows=num_rows, table_type=table_type
                 )
@@ -309,6 +327,118 @@ class SCM:
             )
             self.bi_fk_pk_graph_map[foreign_table_name] = bi_g
 
+    def _apply_projection(self, projection, tensor: torch.Tensor) -> torch.Tensor:
+        if self.fixed_mlp:
+            return projection(tensor)
+        return torch.stack([projection(tensor[i]) for i in range(len(tensor))], dim=0)
+
+    @torch.no_grad()
+    def _generate_df_quantile(
+        self,
+        num_rows: int,
+        min_timestamp: pd.Timestamp | None = None,
+        max_timestamp: pd.Timestamp | None = None,
+    ):
+        """Evaluate PluRel's per-table SCM node-by-node for eager quantile decoding."""
+        frame_data: dict[str, np.ndarray] = {}
+        if self.pkey_col is not None:
+            frame_data[self.pkey_col] = np.arange(num_rows, dtype=np.int64)
+
+        foreign_input = torch.zeros((num_rows, self.scm_params.mlp_emb_dim))
+        for fkey_col, foreign_table_name in self.fkey_col_to_pkey_table.items():
+            foreign_scm = self.foreign_scm_info[foreign_table_name]
+            bi_g = self.bi_fk_pk_graph_map[foreign_table_name]
+            offsets = np.array(
+                [
+                    bi_g.nodes[list(bi_g.in_edges(f"b{row_idx}"))[0][0]]["node_idx"]
+                    for row_idx in range(num_rows)
+                ],
+                dtype=np.int64,
+            )
+            frame_data[fkey_col] = offsets
+            parent_col_nodes = sorted(foreign_scm.col_nodes)
+            if not parent_col_nodes:
+                continue
+            weight = 1.0 / len(parent_col_nodes)
+            for p_node in parent_col_nodes:
+                p_attrs = foreign_scm.dag.graph.nodes[p_node]
+                col_name = p_attrs["col_name"]
+                encoder = p_attrs["collation_encoders"][(foreign_table_name, self.table_name)]
+                parent_vals = torch.from_numpy(foreign_scm.df[col_name].to_numpy(copy=True))
+                if p_attrs["_stype"] == stype.numerical:
+                    parent_vals = parent_vals.float().reshape(-1, 1)
+                else:
+                    parent_vals = parent_vals.long()
+                gathered = parent_vals[offsets]
+                foreign_input += weight * self._apply_projection(encoder, gathered).reshape(
+                    num_rows, self.scm_params.mlp_emb_dim
+                )
+
+        node_values: dict[int, torch.Tensor] = {}
+        self.category_calibrations = {}
+        for gen in nx.topological_generations(self.dag.graph):
+            for node in gen:
+                attrs = self.dag.graph.nodes[node]
+                node_stype = attrs["_stype"]
+                if node in self.source_nodes:
+                    raw = [
+                        self.source_node_to_ts_data_gen[node].get_value(row_idx=r)
+                        for r in range(num_rows)
+                    ]
+                    value = torch.tensor(raw, dtype=torch.float32)
+                else:
+                    noise_dist = attrs["noise_dist"]
+                    node_emb = (
+                        noise_dist.sample(
+                            sample_shape=(num_rows, self.scm_params.mlp_emb_dim)
+                        ).reshape(num_rows, self.scm_params.mlp_emb_dim)
+                        / self.scm_params.mlp_emb_dim
+                    )
+                    for parent_node in self.dag.graph.predecessors(node):
+                        encoder = self.dag.graph.edges[parent_node, node]["encoder"]
+                        weight = self.dag.graph.get_edge_data(parent_node, node)["weight"]
+                        parent_emb = self._apply_projection(
+                            encoder, node_values[parent_node]
+                        ).reshape(num_rows, self.scm_params.mlp_emb_dim)
+                        node_emb += weight * parent_emb
+                    node_emb = node_emb + foreign_input
+                    decoder = attrs["decoder"]
+                    value = self._apply_projection(decoder, node_emb).reshape(num_rows)
+
+                if node_stype == stype.categorical:
+                    num_categories = attrs["num_categories"]
+                    if self.quantile_seed is not None:
+                        q_seed = keyed_seed(
+                            self.quantile_seed, "local-quantile", self.table_name, int(node)
+                        )
+                    else:
+                        q_seed = int(np.random.randint(0, 1 << 31))
+                    rng = np.random.default_rng(q_seed)
+                    value, calibration = calibrate_quantiles(
+                        value, num_categories, self.categorical_alpha_choices, rng
+                    )
+                    key = attrs.get("col_name", f"latent:{node}")
+                    self.category_calibrations[key] = calibration
+                    node_values[node] = value.long()
+                else:
+                    node_values[node] = value.float().reshape(num_rows, 1)
+
+        for node in sorted(self.col_nodes):
+            col_name = self.dag.graph.nodes[node]["col_name"]
+            if self.dag.graph.nodes[node]["_stype"] == stype.categorical:
+                frame_data[col_name] = node_values[node].cpu().numpy().astype(np.int64)
+            else:
+                frame_data[col_name] = (
+                    node_values[node].reshape(-1).cpu().numpy().astype(np.float64)
+                )
+
+        self.df = pd.DataFrame(frame_data)
+        if min_timestamp and max_timestamp:
+            self.df["date"] = pd.date_range(
+                start=min_timestamp, end=max_timestamp, periods=num_rows
+            )
+        return self.df
+
     def generate_df(
         self,
         num_rows: int,
@@ -319,6 +449,12 @@ class SCM:
         self.num_rows = num_rows
         self.initialize_ts_data_gens(num_rows=num_rows, table_type=table_type)
         self.initialize_bi_fk_pk_graph_map()
+        if self.categorical_alpha_choices is not None:
+            return self._generate_df_quantile(
+                num_rows=num_rows,
+                min_timestamp=min_timestamp,
+                max_timestamp=max_timestamp,
+            )
         self.df = pd.DataFrame(
             [
                 self.generate_row(row_idx=row_idx)

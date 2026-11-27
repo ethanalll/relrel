@@ -194,21 +194,35 @@ class SyntheticDataset(Dataset):
         return df
 
     def process_categorical_data(self, df, feature_columns, pkey_col, fkey_cols):
-        """As of now only binary classification is supported, so we need to convert int columns for categorical data into boolean."""
-        for col_name, _type in df.dtypes.items():
+        """Format categorical columns according to ``config.categorical_export``.
+
+        Default ``plurel_bool`` matches PluRel v1.0.0 bit-for-bit: all numeric
+        categoricals become ``(col > 0).astype(bool)`` and constant ones are dropped.
+        """
+        mode = self.config.categorical_export
+        for col_name, _type in list(df.dtypes.items()):
             if col_name not in [pkey_col, *fkey_cols] and _type in [int]:
                 feature_column_info = feature_columns[col_name]
                 categories = feature_column_info["categories"]
                 if not categories:
                     continue
-                # convert all numeric categorical columns into boolean
-                if type(categories[0]) == int:
-                    df[col_name] = (df[col_name] > 0).astype(bool)
-                    # drop columns which only have True/False values.
-                    if len(df[col_name].unique()) == 1:
-                        df.drop(columns=[col_name], inplace=True)
-                elif type(categories[0]) == str:
-                    df[col_name] = df[col_name].map(lambda i: categories[i])
+                if mode == "plurel_bool":
+                    if type(categories[0]) == int:
+                        df[col_name] = (df[col_name] > 0).astype(bool)
+                        if len(df[col_name].unique()) == 1:
+                            df.drop(columns=[col_name], inplace=True)
+                    elif type(categories[0]) == str:
+                        df[col_name] = df[col_name].map(lambda i: categories[i])
+                elif mode == "text":
+                    if categories == [0, 1]:
+                        df[col_name] = df[col_name].astype(bool)
+                    else:
+                        df[col_name] = df[col_name].map(lambda i: str(categories[int(i)]))
+                elif mode == "raw_int":
+                    if categories == [0, 1]:
+                        df[col_name] = df[col_name].astype(bool)
+                    elif type(categories[0]) == str:
+                        df[col_name] = df[col_name].map(lambda i: categories[int(i)])
         return df
 
     def make_db(self) -> Database:
@@ -256,8 +270,16 @@ class SyntheticDataset(Dataset):
                     foreign_scm_info=foreign_scm_info,
                     scm_params=self.config.scm_params,
                     dag_params=self.config.dag_params,
+                    categorical_alpha_choices=self.config.rscm.categorical_alpha_choices,
+                    fixed_mlp=bool(self.config.fixed_mlp),
+                    quantile_seed=self.seed,
                 )
-                if table_type == TableType.Activity:
+                include_dates = (
+                    True
+                    if self.config.include_activity_dates is None
+                    else self.config.include_activity_dates
+                )
+                if include_dates and table_type == TableType.Activity:
                     min_timestamp, max_timestamp = (
                         self.min_timestamp,
                         self.max_timestamp,
@@ -271,6 +293,15 @@ class SyntheticDataset(Dataset):
                     max_timestamp=max_timestamp,
                 )
                 table_name_to_scm[table_name] = scm
+
+        self.local_diagnostics = {
+            name: {
+                "family": type(scm.dag).__name__,
+                "local_edges": scm.dag.graph.number_of_edges(),
+                "quantiles": scm.category_calibrations,
+            }
+            for name, scm in sorted(table_name_to_scm.items())
+        }
 
         table_dict = {}
 
@@ -353,6 +384,11 @@ class SyntheticDataset(Dataset):
             tables, self.column_graph, self.skeleton, self.config, self.seed
         )
         frames = self.generator.evaluate()
+        include_dates = (
+            False
+            if self.config.include_activity_dates is None
+            else self.config.include_activity_dates
+        )
         result = {}
         for name, info in tables.items():
             pk, fks = info["pkey_col"], info["fkey_col_to_pkey_table"]
@@ -362,6 +398,14 @@ class SyntheticDataset(Dataset):
             with scoped_rng(keyed_seed(self.seed, "postprocessing", name)):
                 frame = self.implant_nan(frames[name], pk, list(fks))
                 frame = self.process_categorical_data(frame, features, pk, list(fks))
-            result[name] = Table(df=frame, pkey_col=pk, fkey_col_to_pkey_table=fks, time_col=None)
+            time_col = None
+            if include_dates and info.get("type") == TableType.Activity:
+                time_col = "date"
+                frame[time_col] = pd.date_range(
+                    start=self.min_timestamp, end=self.max_timestamp, periods=len(frame)
+                )
+            result[name] = Table(
+                df=frame, pkey_col=pk, fkey_col_to_pkey_table=fks, time_col=time_col
+            )
         self.causal_metadata = self.generator.sidecar()
         return Database(result)

@@ -243,7 +243,12 @@ class Config:
     schema_file: str | None = None
     generation_mode: str = "legacy_scm"
     rscm: RSCMParams = field(default_factory=RSCMParams)
+    fixed_mlp: bool | None = None
+    include_activity_dates: bool | None = None
+    categorical_export: Literal["plurel_bool", "text", "raw_int"] = "plurel_bool"
 
     def __post_init__(self):
         if self.generation_mode not in ("legacy_scm", "global_rscm"):
             raise ValueError("generation_mode must be 'legacy_scm' or 'global_rscm'")
+        if self.categorical_export not in ("plurel_bool", "text", "raw_int"):
+            raise ValueError("categorical_export must be 'plurel_bool', 'text', or 'raw_int'")

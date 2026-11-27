@@ -53,63 +53,33 @@ pixi run pytest
 Based on [PluRel](https://github.com/stanford-star/plurel), release v1.0.0.
 See [LICENSE](LICENSE) for the license and original copyright notice.
 
-## RT ablations
+## RT experiments
 
-Use `make synthesize` and `make export` from this repo. Set `DATA` to the same
-absolute path in RelRel and RT. The default is `~/scratch/relrel-rt`.
+Use `make synthesize`, `make export`, or `make generate` (synthesize + export) from this repo. Set `DATA` to the same absolute path in RelRel and RT (default `~/scratch/relrel-rt`). Every run specifies hyperparameters directly—there is no `SUITE`/`ARM` indirection, and the only DAG modes are `local` and `global`.
 
 ```sh
 pixi install
 export DATA=/shared/scratch/relrel-rt
-make synthesize SUITE=factorial COUNT=128 WORKERS=8
-make export SUITE=factorial
-make synthesize SUITE=sampler COUNT=128 WORKERS=8
-make export SUITE=sampler
-make synthesize SUITE=holdout SPLIT=val COUNT=16 WORKERS=8
-make export SUITE=holdout SPLIT=val
+
+# Bit-exact PluRel v1.0.0 baseline (DAG=local, DECODING=original, FIXED_MLP=0, DATES=activity, EXPORT_CAT=plurel_bool)
+make generate NAME=local-orig   DAG=local  DECODING=original COUNT=128 WORKERS=8
+make generate NAME=local-quant  DAG=local  DECODING=quantile COUNT=128 WORKERS=8
+make generate NAME=global-orig  DAG=global DECODING=original MAX_HOPS=2 COUNT=128 WORKERS=8
+make generate NAME=global-quant DAG=global DECODING=quantile MAX_HOPS=2 COUNT=128 WORKERS=8
+
+# Direct sampler matched to exact realized edges and seeds of global-quant
+make generate NAME=global-direct DAG=global DECODING=quantile SAMPLER=direct \
+  MATCH_EDGES_FROM=global-quant WORKERS=8
+
+# Disjoint synthetic holdout corpus
+make generate NAME=holdout-val DAG=global DECODING=quantile COUNT=16 SEED_START=100000 WORKERS=8
 ```
 
-- **Factorial** has four arms combining per-table SCMs or global RSCM with
-  original categorical decoding or eager quantile decoding.
-- **Sampler** has two global-RSCM arms with eager quantiles. For each seed, the
-  direct sampler matches the original graph-family sampler's realized edge
-  count. Pairs that cannot meet the budget are recorded and replaced.
-- **Holdout** creates one reference corpus using a mixture of the four factorial
-  settings and starting from a separate seed range.
+- **`DAG=local`**: Runs PluRel's per-table `SCM` directly. With default `DECODING=original`, `FIXED_MLP=0`, `DATES=activity`, and `EXPORT_CAT=plurel_bool`, output is **bit-exact** to PluRel v1.0.0 (`2a273cf`). With `DECODING=quantile`, each categorical node is eagerly discretized with Dirichlet quantile cutoffs (`ALPHA=1.0,5.0`) before descendants read it.
+- **`DAG=global`**: Runs the global column-DAG RSCM (`GlobalSCMGenerator`) on the same PluRel framework (timestamps, missingness, categorical export). Controlled directly by `DECODING`, `ALPHA`, `FIXED_MLP`, `SAMPLER` (`family` | `direct`), `MAX_HOPS` (`1` | `2`), `COL_PARENT_CAP`, `DEGREE`, `SCM_FAMILIES`, `PARENT_POLICY` (`bounded` | `full`), `CELL_PARENT_CAP`, `ROW_POOLING` (`mean` | `sum`), `DATES`, `EXPORT_CAT`, `MATCH_SEEDS_FROM`, and `MATCH_EDGES_FROM`.
 
-Each accepted pair or quartet shares the schema, FK skeleton, feature inventory,
-activity dates, missingness draws, and eligible RT targets. The table schema uses
-the three original schema families. Local SCMs draw independently per table
-from the five original SCM families. The global SCM draws one database-wide
-proposal from those same five families and filters edges by FK reachability.
-The per-table SCM retains latent nodes and dense forward-FK inputs. Both
-quantile arms discretize each categorical column before descendants read it.
-
-Use a fresh `DATA` root for the dated paired corpora. Their manifests record the
-`paired-activity-dates-v1` generation profile. For exact historical references,
-use the [original PluRel v1.0.0 generator](https://github.com/stanford-star/plurel/tree/2a273cfd21933ee4893dfcb862a3edaed45ac665)
-and the [RelRel 40cca23 generator](https://github.com/ethanalll/relrel/tree/40cca23880063cb0d74829ef387e01a028600563).
-The original PluRel release generates dated activity tables and samples MLP
-activations per call. RelRel 40cca23 exports timestamp-free tables and fixes
-MLP activations. It also retains multiclass categorical values. The paired
-factorial uses dates, fixed activations, and a common export policy across all
-four arms. To generate the two standalone references under the same `DATA` root:
-
-```sh
-make reference REFERENCE=plurel COUNT=4 SEED_START=10000
-make reference REFERENCE=relrel COUNT=4 SEED_START=10000
-```
-
-These commands write to `DATA/synthetic/reference/<reference>/`. The RelRel
-reference uses quantile decoding with the five-family prior. For the PluRel
-Table 1 comparison, use the
-[released synthetic-only checkpoint](https://huggingface.co/stanford-star/rt-plurel/blob/main/paper/synthetic-pretrain_rdb_1024_size_4b.pt).
-
-Raw tables and causal diagnostics go in `DATA/synthetic/raw/<suite>/<split>/`.
-Model-ready tables and the training target manifest go in
-`DATA/synthetic/rt/<suite>/<split>/<arm>/`. The export represents multicategory
-features as text contexts and preserves Boolean and numerical training targets.
+Raw tables and causal diagnostics go in `DATA/synthetic/raw/<NAME>/`.
+Model-ready tables and the training target manifest go in `DATA/synthetic/rt/<NAME>/`.
 Run preprocessing and training from the RT repo using its `EXPERIMENTS.md`.
 
-For a smoke test, use a separate `DATA` root and pass `TINY=1 COUNT=4` to
-`make synthesize`. `make help` lists the available overrides.
+For a smoke test, use a separate `DATA` root and pass `TINY=1 COUNT=4` to `make generate`. `make help` lists all available hyperparameter overrides.

@@ -1,16 +1,21 @@
 import json
+import subprocess
+import sys
+import tempfile
 from dataclasses import replace
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from pandas.api.types import is_integer_dtype
 from relbench.base import Database
 from torch_frame import stype
 
-from relrel import experiments
-from relrel.config import Choices, Config
+from relrel.config import Choices, Config, DAGParams, DatabaseParams
+from relrel.dag import ErdosRenyi
 from relrel.dataset import SyntheticDataset
-from relrel.experiments import experiment_config, export, generate_reference, make_case, write_json
+from relrel.experiments import RunSpec, export, synthesize
 
 SCM_FAMILIES = {
     "ErdosRenyi",
@@ -18,12 +23,6 @@ SCM_FAMILIES = {
     "RandomTree",
     "ReverseRandomTree",
     "Layered",
-}
-ARMS = {
-    "local-original": (False, False),
-    "local-quantile": (False, True),
-    "global-original": (True, False),
-    "global-quantile": (True, True),
 }
 
 
@@ -36,29 +35,11 @@ def assert_foreign_keys_valid(database):
             assert table.df[column].isin(parent.df[parent.pkey_col]).all()
 
 
-def assert_paired_structure(reference, arm):
-    assert reference.table_dict.keys() == arm.table_dict.keys()
-    for name, expected in reference.table_dict.items():
-        actual = arm.table_dict[name]
-        assert actual.pkey_col == expected.pkey_col
-        assert actual.fkey_col_to_pkey_table == expected.fkey_col_to_pkey_table
-        assert actual.time_col == expected.time_col
-        keys = [expected.pkey_col, *expected.fkey_col_to_pkey_table]
-        if expected.time_col:
-            keys.append(expected.time_col)
-        pd.testing.assert_frame_equal(actual.df[keys], expected.df[keys])
-        pd.testing.assert_series_equal(actual.df.dtypes, expected.df.dtypes)
-        pd.testing.assert_frame_equal(actual.df.isna(), expected.df.isna())
-
-
 def test_paper_graph_family_prior_is_preserved():
     config = Config()
     assert config.scm_params.scm_layout_choices.kind == "set"
     assert len(config.scm_params.scm_layout_choices.value) == 5
     assert set(config.scm_params.scm_layout_choices.value) == SCM_FAMILIES
-    assert experiment_config(False).scm_params.scm_layout_choices == (
-        config.scm_params.scm_layout_choices
-    )
     assert config.database_params.table_layout_choices.value == [
         "BarabasiAlbert",
         "ReverseRandomTree",
@@ -66,193 +47,211 @@ def test_paper_graph_family_prior_is_preserved():
     ]
 
 
-def test_canonical_generators_have_different_timestamp_contracts():
-    config = experiment_config(True)
-    legacy = SyntheticDataset(10000, replace(config, generation_mode="legacy_scm")).make_db()
-    global_config = replace(
-        config,
-        generation_mode="global_rscm",
-        rscm=replace(config.rscm, categorical_alpha_choices=(1.0, 5.0)),
+@pytest.mark.parametrize("seed", [0, 1, 10000])
+def test_local_original_is_bit_accurate_to_plurel_v1(seed, tmp_path):
+    """DAG=local, DECODING=original, FIXED_MLP=0, DATES=activity, EXPORT_CAT=plurel_bool
+    must match the unmodified PluRel v1.0.0 (2a273cf) generator bit-for-bit."""
+    spec = RunSpec(
+        dag="local",
+        decoding="original",
+        fixed_mlp=False,
+        dates="activity",
+        export_cat="plurel_bool",
+        tiny=True,
     )
-    global_data = SyntheticDataset(10000, global_config).make_db()
-    assert_foreign_keys_valid(legacy)
-    assert_foreign_keys_valid(global_data)
-    dates = [table.df["date"] for table in legacy.table_dict.values() if table.time_col == "date"]
-    assert dates
-    assert all(series.is_monotonic_increasing and series.is_unique for series in dates)
-    assert all(table.time_col is None for table in global_data.table_dict.values())
-    assert all("date" not in table.df for table in global_data.table_dict.values())
+    synthesize(tmp_path, "local-orig", spec, count=1, seed_start=seed, workers=1)
+    generated = Database.load(tmp_path / f"synthetic/raw/local-orig/db-{seed:08d}/db")
 
-
-@pytest.mark.parametrize("reference", ["plurel", "relrel"])
-def test_reference_exports_keep_their_own_table_contract(reference, tmp_path):
-    generate_reference(tmp_path, reference, count=1, seed=10000, tiny=True)
-    output = tmp_path / "synthetic/reference" / reference
-    manifest = json.loads((output / "corpus.json").read_text())
-    assert manifest["reference_revision"] == experiments.REFERENCE_REVISIONS[reference]
-    assert manifest["categorical_export_policy"] == (
-        "plurel_v1_gt0_bool" if reference == "plurel" else "binary_bool_multiclass_int64"
-    )
-    assert manifest["databases"] == [{"id": "db-00010000", "seed": 10000}]
-    database = Database.load(output / "db-00010000/db")
-    assert_foreign_keys_valid(database)
-    if reference == "plurel":
-        assert any(table.time_col == "date" for table in database.table_dict.values())
-    else:
-        assert all(table.time_col is None for table in database.table_dict.values())
-        generation = json.loads((output / "db-00010000/generation.json").read_text())
-        assert generation["categorical_export_version"] == 2
-        assert any(
-            is_integer_dtype(table.df[column]) and table.df[column].nunique() > 2
-            for table in database.table_dict.values()
-            for column in table.df
-            if column != table.pkey_col and column not in table.fkey_col_to_pkey_table
+    # Compare directly against SyntheticDataset(seed, legacy_scm) AND original 2a273cf if git history exists.
+    legacy_cfg = Config(
+        database_params=DatabaseParams(
+            num_tables_choices=Choices("set", [3]),
+            num_cols_choices=Choices("range", [4, 4]),
+            num_rows_entity_table_choices=Choices("set", [12]),
+            num_rows_activity_table_choices=Choices("set", [24]),
         )
-
-
-@pytest.mark.parametrize("seed", [10000, 10001, 10002])
-def test_factorial_arms_control_schema_and_graphs(seed, tmp_path):
-    case = make_case(seed, "factorial", True, tmp_path)
-    assert "rejected" not in case, case
-    assert case["arms"].keys() == ARMS.keys()
-    generated = {}
-    for arm, (global_dag, quantiles) in ARMS.items():
-        info = case["arms"][arm]
-        assert info["global_dag"] is global_dag
-        assert info["quantiles"] is quantiles
-        assert info["tasks"]
-        assert info["clf_tasks"] + info["reg_tasks"] == len(info["tasks"])
-        path = tmp_path / arm / case["id"]
-        db = Database.load(path / "db")
-        assert_foreign_keys_valid(db)
-        expected_tasks = []
-        for table_name, table in sorted(db.table_dict.items()):
-            for col in sorted(table.df.columns):
-                if col in (table.time_col, table.pkey_col, *table.fkey_col_to_pkey_table):
-                    continue
-                if pd.api.types.is_bool_dtype(table.df[col]):
-                    kind = "clf"
-                elif pd.api.types.is_float_dtype(table.df[col]):
-                    kind = "reg"
-                else:
-                    continue
-                if table.df[col].nunique(dropna=True) > 1:
-                    expected_tasks.append([case["id"], table_name, col, [], kind])
-        assert info["tasks"] == expected_tasks
-        generated[arm] = (db, json.loads((path / "causal.json").read_text()))
-
-    reference, local = generated["local-original"]
-    assert any(table.time_col == "date" for table in reference.table_dict.values())
-    for db, _ in generated.values():
-        assert_paired_structure(reference, db)
-    local_quantile = generated["local-quantile"][1]
-    for name, diagnostics in local["local_scm"].items():
-        assert diagnostics["family"] in SCM_FAMILIES
-        assert diagnostics["graph_sha256"] == local_quantile["local_scm"][name]["graph_sha256"]
-        assert not diagnostics["quantiles"]
-    assert any(table["quantiles"] for table in local_quantile["local_scm"].values())
-
-    global_original = generated["global-original"][1]
-    global_quantile = generated["global-quantile"][1]
-    assert global_original["column_graph"] == global_quantile["column_graph"]
-    assert global_original["column_graph"]["metadata"]["proposal_family"] in SCM_FAMILIES
-    assert not global_original.get("categorical_calibration")
-    assert global_quantile["categorical_calibration"]
-
-
-def test_factorial_replay_and_export_keep_dates_and_targets(tmp_path):
-    seed = 10000
-    source = tmp_path / "synthetic/raw/factorial/train"
-    source.mkdir(parents=True)
-    repeated = tmp_path / "repeated"
-    repeated.mkdir()
-    case = make_case(seed, "factorial", True, source)
-    assert "rejected" not in case, case
-    assert make_case(seed, "factorial", True, repeated) == case
-    write_json(
-        source / "corpus.json",
-        {"cases": [case], "generation_profile": experiments.GENERATION_PROFILE},
     )
-    export(tmp_path, "factorial", "train")
+    legacy = SyntheticDataset(seed, legacy_cfg).make_db()
+    assert set(generated.table_dict) == set(legacy.table_dict)
+    for name in sorted(legacy.table_dict):
+        expected, actual = legacy.table_dict[name], generated.table_dict[name]
+        assert actual.pkey_col == expected.pkey_col
+        assert actual.fkey_col_to_pkey_table == expected.fkey_col_to_pkey_table
+        assert actual.time_col == expected.time_col
+        pd.testing.assert_frame_equal(actual.df, expected.df, check_exact=True)
 
-    output = tmp_path / "synthetic/rt/factorial/train"
-    for arm in ARMS:
-        database = Database.load(source / arm / case["id"] / "db")
-        replay = Database.load(repeated / arm / case["id"] / "db")
-        exported = Database.load(output / arm / case["id"] / "db")
-        for name, table in database.table_dict.items():
-            pd.testing.assert_frame_equal(table.df, replay.table_dict[name].df)
-            assert exported.table_dict[name].time_col == table.time_col
-            if table.time_col:
-                pd.testing.assert_series_equal(
-                    exported.table_dict[name].df[table.time_col], table.df[table.time_col]
+    repo = Path(__file__).resolve().parents[1]
+    check = subprocess.run(
+        ["git", "cat-file", "-e", "2a273cf^{commit}"], cwd=repo, capture_output=True
+    )
+    if check.returncode == 0:
+        with tempfile.TemporaryDirectory() as orig_tmp:
+            archive = subprocess.check_output(["git", "archive", "2a273cf", "plurel"], cwd=repo)
+            subprocess.run(["tar", "-x", "-C", orig_tmp], input=archive, check=True)
+            sys.path.insert(0, orig_tmp)
+            try:
+                from plurel.config import (
+                    Choices as PChoices,
                 )
-        manifest = json.loads((output / arm / "corpus.json").read_text())
-        assert manifest["generation_profile"] == experiments.GENERATION_PROFILE
-        assert manifest["tasks"] == case["arms"][arm]["tasks"]
-        assert manifest["databases"][0]["seed"] == seed
+                from plurel.config import (
+                    Config as PConfig,
+                )
+                from plurel.config import (
+                    DatabaseParams as PDatabaseParams,
+                )
+                from plurel.dataset import SyntheticDataset as PSyntheticDataset
+
+                p_cfg = PConfig(
+                    database_params=PDatabaseParams(
+                        num_tables_choices=PChoices("set", [3]),
+                        num_cols_choices=PChoices("range", [4, 4]),
+                        num_rows_entity_table_choices=PChoices("set", [12]),
+                        num_rows_activity_table_choices=PChoices("set", [24]),
+                    )
+                )
+                p_db = PSyntheticDataset(seed, p_cfg).make_db()
+                assert set(generated.table_dict) == set(p_db.table_dict)
+                for name in sorted(p_db.table_dict):
+                    expected, actual = p_db.table_dict[name], generated.table_dict[name]
+                    assert actual.pkey_col == expected.pkey_col
+                    assert actual.fkey_col_to_pkey_table == expected.fkey_col_to_pkey_table
+                    assert actual.time_col == expected.time_col
+                    pd.testing.assert_frame_equal(actual.df, expected.df, check_exact=True)
+            finally:
+                sys.path.remove(orig_tmp)
+                for mod in [k for k in sys.modules if k == "plurel" or k.startswith("plurel.")]:
+                    del sys.modules[mod]
 
 
-@pytest.mark.parametrize("family", sorted(SCM_FAMILIES))
-def test_each_paper_family_works_in_both_dag_scopes(family, tmp_path, monkeypatch):
-    config = experiment_config(True)
-    config = replace(
-        config,
-        scm_params=replace(config.scm_params, scm_layout_choices=Choices("set", [family])),
-    )
-    monkeypatch.setattr(experiments, "experiment_config", lambda tiny: config)
-    case = make_case(10000, "factorial", True, tmp_path)
-    assert "rejected" not in case, case
+@pytest.mark.parametrize("dag", ["local", "global"])
+@pytest.mark.parametrize("decoding", ["original", "quantile"])
+def test_local_and_global_with_both_decoders_and_export(dag, decoding, tmp_path):
+    spec = RunSpec(dag=dag, decoding=decoding, tiny=True)
+    name = f"{dag}-{decoding}"
+    synthesize(tmp_path, name, spec, count=2, seed_start=10000, workers=1)
+    export(tmp_path, name)
 
-    for arm, (global_dag, _) in ARMS.items():
-        causal = json.loads((tmp_path / arm / case["id"] / "causal.json").read_text())
-        if global_dag:
-            assert causal["column_graph"]["metadata"]["proposal_family"] == family
+    raw_manifest = json.loads((tmp_path / f"synthetic/raw/{name}/corpus.json").read_text())
+    rt_manifest = json.loads((tmp_path / f"synthetic/rt/{name}/corpus.json").read_text())
+    assert raw_manifest["count"] == 2
+    assert len(rt_manifest["databases"]) == 2
+    assert rt_manifest["tasks"]
+
+    for entry in raw_manifest["databases"]:
+        db_id = entry["id"]
+        db = Database.load(tmp_path / f"synthetic/rt/{name}/{db_id}/db")
+        assert_foreign_keys_valid(db)
+        assert any(table.time_col == "date" for table in db.table_dict.values())
+        causal = json.loads((tmp_path / f"synthetic/raw/{name}/{db_id}/causal.json").read_text())
+        if dag == "global":
+            assert causal["column_graph"]["metadata"]["proposal_family"] in SCM_FAMILIES
+            if decoding == "quantile":
+                assert causal.get("categorical_calibration")
+            else:
+                assert not causal.get("categorical_calibration")
         else:
-            assert all(table["family"] == family for table in causal["local_scm"].values())
+            assert all(t["family"] in SCM_FAMILIES for t in causal["local_scm"].values())
+            if decoding == "quantile":
+                assert any(t["quantiles"] for t in causal["local_scm"].values())
+            else:
+                assert not any(t["quantiles"] for t in causal["local_scm"].values())
+
+    for db_id, table_name, target, _, kind in rt_manifest["tasks"]:
+        db = Database.load(tmp_path / f"synthetic/rt/{name}/{db_id}/db")
+        table = db.table_dict[table_name]
+        assert target not in (table.pkey_col, table.time_col, *table.fkey_col_to_pkey_table)
+        assert table.df[target].nunique(dropna=True) > 1
+        assert (kind == "clf") == pd.api.types.is_bool_dtype(table.df[target])
 
 
-def test_decoder_swap_preserves_numeric_only_corpora(tmp_path, monkeypatch):
-    config = experiment_config(True)
-    config = replace(
-        config,
-        scm_params=replace(config.scm_params, col_stype_choices=Choices("set", [stype.numerical])),
+def test_direct_sampler_matches_family_edges_and_seeds(tmp_path):
+    fam_spec = RunSpec(dag="global", decoding="quantile", sampler="family", tiny=True)
+    dir_spec = RunSpec(dag="global", decoding="quantile", sampler="direct", tiny=True)
+    synthesize(tmp_path, "fam", fam_spec, count=3, seed_start=10000, workers=1)
+    synthesize(
+        tmp_path,
+        "dir",
+        dir_spec,
+        count=3,
+        seed_start=10000,
+        workers=1,
+        match_edges_from="fam",
     )
-    monkeypatch.setattr(experiments, "experiment_config", lambda tiny: config)
-    case = make_case(10000, "factorial", True, tmp_path)
-    assert "rejected" not in case, case
-    for scope in ("local", "global"):
-        original = Database.load(tmp_path / f"{scope}-original" / case["id"] / "db")
-        quantile = Database.load(tmp_path / f"{scope}-quantile" / case["id"] / "db")
-        for name, table in original.table_dict.items():
-            pd.testing.assert_frame_equal(table.df, quantile.table_dict[name].df, check_exact=True)
+    fam_m = json.loads((tmp_path / "synthetic/raw/fam/corpus.json").read_text())
+    dir_m = json.loads((tmp_path / "synthetic/raw/dir/corpus.json").read_text())
+    assert [d["seed"] for d in dir_m["databases"]] == [d["seed"] for d in fam_m["databases"]]
+    assert [d["edges"] for d in dir_m["databases"]] == [d["edges"] for d in fam_m["databases"]]
+    assert [d["skeleton_sha256"] for d in dir_m["databases"]] == [
+        d["skeleton_sha256"] for d in fam_m["databases"]
+    ]
 
 
-@pytest.mark.parametrize("seed", [10000, 10001, 10002, 10003])
-def test_holdout_preserves_paired_scope_and_decoder_selection(seed, tmp_path):
-    case = make_case(seed, "holdout", True, tmp_path)
-    assert "rejected" not in case, case
-    assert list(case["arms"]) == ["reference"]
-    reference = case["arms"]["reference"]
-    assert reference["global_dag"] is bool(seed % 2)
-    assert reference["quantiles"] is bool((seed // 2) % 2)
-    db = Database.load(tmp_path / "reference" / case["id"] / "db")
-    assert any(table.time_col == "date" for table in db.table_dict.values())
+def test_hyperparam_controls_hops_pooling_dates_and_export_cat(tmp_path):
+    spec_h1 = RunSpec(
+        dag="global",
+        decoding="quantile",
+        max_hops=1,
+        parent_policy="full",
+        row_pooling="sum",
+        dates="none",
+        export_cat="raw_int",
+        tiny=True,
+    )
+    synthesize(tmp_path, "h1-static", spec_h1, count=1, seed_start=10000, workers=1)
+    db = Database.load(tmp_path / "synthetic/raw/h1-static/db-00010000/db")
+    assert all(table.time_col is None for table in db.table_dict.values())
+    causal = json.loads((tmp_path / "synthetic/raw/h1-static/db-00010000/causal.json").read_text())
+    assert all(len(edge["path"]) <= 1 for edge in causal["column_graph"]["edges"])
+    assert causal["settings"]["parent_policy"] == "full"
+    assert causal["settings"]["row_pooling"] == "sum"
+    assert any(
+        is_integer_dtype(table.df[col]) and table.df[col].nunique() > 2
+        for table in db.table_dict.values()
+        for col in table.df
+        if col != table.pkey_col and col not in table.fkey_col_to_pkey_table
+    )
+
+    spec_text = RunSpec(
+        dag="local",
+        decoding="quantile",
+        fixed_mlp=True,
+        export_cat="text",
+        tiny=True,
+    )
+    synthesize(tmp_path, "local-text", spec_text, count=1, seed_start=10000, workers=1)
+    export(tmp_path, "local-text")
+    db_text = Database.load(tmp_path / "synthetic/rt/local-text/db-00010000/db")
+    assert any(
+        pd.api.types.is_string_dtype(table.df[col])
+        for table in db_text.table_dict.values()
+        for col in table.df
+        if col not in (table.pkey_col, table.time_col, *table.fkey_col_to_pkey_table)
+    )
 
 
-def test_sampler_suite_matches_realized_edges(tmp_path):
-    case = make_case(10000, "sampler", True, tmp_path)
-    assert "rejected" not in case, case
-    assert set(case["arms"]) == {"family", "direct"}
-    assert case["arms"]["direct"]["edges"] == case["arms"]["family"]["edges"]
-    assert case["arms"]["direct"]["requested_edges"] == case["arms"]["family"]["edges"]
+def test_validation_rejects_invalid_hyperparam_combinations():
+    with pytest.raises(ValueError, match="require --dag=global"):
+        RunSpec(dag="local", sampler="direct").validate()
+    with pytest.raises(ValueError, match="require --sampler=direct"):
+        RunSpec(dag="global", sampler="family", degree=(2.0,)).validate()
+    with pytest.raises(ValueError, match="requires --degree or --match-edges-from"):
+        RunSpec(dag="global", sampler="direct").validate()
+
+
+def test_decoder_swap_preserves_numeric_only_global_corpus(tmp_path):
+    base = RunSpec(dag="global", decoding="original", tiny=True).to_config()
+    num_only = replace(
+        base,
+        scm_params=replace(base.scm_params, col_stype_choices=Choices("set", [stype.numerical])),
+    )
+    quant = replace(num_only, rscm=replace(num_only.rscm, categorical_alpha_choices=(1.0, 5.0)))
+    db_orig = SyntheticDataset(10000, num_only).make_db()
+    db_quant = SyntheticDataset(10000, quant).make_db()
+    for name, table in db_orig.table_dict.items():
+        pd.testing.assert_frame_equal(table.df, db_quant.table_dict[name].df, check_exact=True)
 
 
 def test_erdos_renyi_deadlock_guard_terminates():
-    from relrel.config import DAGParams
-    from relrel.dag import ErdosRenyi
-
-    # Very low p would spin forever if ErdosRenyi never moved past a disconnected fixed seed.
     dag = ErdosRenyi(
         num_nodes=4,
         dag_params=DAGParams(er_p_choices=Choices("set", [0.15])),
@@ -262,11 +261,7 @@ def test_erdos_renyi_deadlock_guard_terminates():
 
 
 def test_global_schema_rng_does_not_clobber_keyed_stream():
-    # Regression test: seed=0 and seed=1 both use keyed_seed(seed, "schema") cleanly
-    # and reproduce identically regardless of external global RNG state.
-    import numpy as np
-
-    config = experiment_config(True)
+    config = RunSpec(dag="global", decoding="quantile", tiny=True).to_config()
     for seed in (0, 1):
         np.random.seed(999)
         first = SyntheticDataset(seed, config)._prepare_global_schema()
@@ -276,3 +271,18 @@ def test_global_schema_rng_does_not_clobber_keyed_stream():
         for name in first:
             assert first[name]["columns"] == second[name]["columns"]
             assert first[name]["fkey_col_to_pkey_table"] == second[name]["fkey_col_to_pkey_table"]
+
+
+def test_global_non_fixed_mlp_is_deterministic_and_sidecar_accurate():
+    spec = RunSpec(dag="global", decoding="quantile", fixed_mlp=False, dates="activity", tiny=True)
+    config = spec.to_config()
+    np.random.seed(111)
+    ds1 = SyntheticDataset(10000, config)
+    db1 = ds1.make_db()
+    np.random.seed(99999)
+    ds2 = SyntheticDataset(10000, config)
+    db2 = ds2.make_db()
+    for name in sorted(db1.table_dict):
+        pd.testing.assert_frame_equal(db1.table_dict[name].df, db2.table_dict[name].df)
+    assert "per-call hidden activations" in ds1.causal_metadata["mechanisms"]
+    assert "activity tables dated" in ds1.causal_metadata["temporal_policy"]
