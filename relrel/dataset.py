@@ -108,7 +108,7 @@ class SyntheticDataset(Dataset):
                 temporary.replace(path)
         return db
 
-    def _get_random_dag_table_relationships(self, num_tables: int):
+    def _get_random_dag_table_relationships(self, num_tables: int, *, use_scoped_rng: bool = False):
         """
         Each table will have the following attributes:
         ```py
@@ -123,7 +123,9 @@ class SyntheticDataset(Dataset):
         ```
         """
         builder = RandomSchemaGraphBuilder(
-            config=self.config, num_tables=num_tables, seed=self.seed
+            config=self.config,
+            num_tables=num_tables,
+            seed=None if use_scoped_rng else self.seed,
         )
         return builder.build_graph()
 
@@ -138,7 +140,11 @@ class SyntheticDataset(Dataset):
         return builder.build_graph()
 
     def configure_table_relationships(
-        self, num_tables: int | None = None, schema_file: str | None = None
+        self,
+        num_tables: int | None = None,
+        schema_file: str | None = None,
+        *,
+        use_scoped_rng: bool = False,
     ) -> nx.DiGraph:
         """
         Define the primary -> foreign key relationships between tables as a DAG.
@@ -152,7 +158,9 @@ class SyntheticDataset(Dataset):
         if schema_file:
             table_relationships = self._get_schema_file_table_relationships(schema_file=schema_file)
         elif num_tables:
-            table_relationships = self._get_random_dag_table_relationships(num_tables=num_tables)
+            table_relationships = self._get_random_dag_table_relationships(
+                num_tables=num_tables, use_scoped_rng=use_scoped_rng
+            )
 
         activity_tables = [
             table
@@ -304,7 +312,7 @@ class SyntheticDataset(Dataset):
         with scoped_rng(keyed_seed(self.seed, "schema")):
             num_tables = self.config.database_params.num_tables_choices.sample_uniform()
             self.table_relationships = self.configure_table_relationships(
-                num_tables=num_tables, schema_file=self.config.schema_file
+                num_tables=num_tables, schema_file=self.config.schema_file, use_scoped_rng=True
             )
         tables = {info["name"]: info for _, info in self.table_relationships.nodes(data=True)}
         # A SQL table without a declared PK still needs a physical row identity.

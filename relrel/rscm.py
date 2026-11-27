@@ -379,7 +379,7 @@ def sample_column_graph(
             with scoped_rng(proposal_seed):
                 family = str(scm_params.scm_layout_choices.sample_uniform())
                 proposal = DAG_REGISTRY[family](
-                    num_nodes=n, dag_params=dag_params, seed=proposal_seed % (1 << 32)
+                    num_nodes=n, dag_params=dag_params, seed=None
                 ).graph.copy()
     else:
         proposal = proposal.copy()

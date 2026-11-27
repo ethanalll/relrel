@@ -61,9 +61,19 @@ class ErdosRenyi(DAG):
 
     def sample(self, num_nodes: int) -> nx.DiGraph:
         is_connected = False
+        attempt = 0
         while not is_connected:
             p = self.dag_params.er_p_choices.sample_uniform()
-            graph = nx.gnp_random_graph(n=num_nodes, p=p, seed=self.seed, directed=True)
+            # Keep the initial attempts identical to PluRel v1.0.0 when a fixed
+            # seed is supplied, but break out if that fixed seed deadlocks.
+            attempt_seed = (
+                None
+                if self.seed is None
+                else self.seed
+                if attempt < 64
+                else (self.seed + attempt) % (1 << 32)
+            )
+            graph = nx.gnp_random_graph(n=num_nodes, p=p, seed=attempt_seed, directed=True)
             ordered_edges = self.order_edges(edges=graph.edges())
             weighted_edges = self.add_edge_weights(edges=ordered_edges)
             graph = nx.DiGraph(weighted_edges)
@@ -74,6 +84,7 @@ class ErdosRenyi(DAG):
                 )
             except Exception:
                 is_connected = False
+            attempt += 1
         return graph
 
 

@@ -36,7 +36,7 @@ class RandomSchemaGraphBuilder:
         seed: Random seed for reproducibility.
     """
 
-    def __init__(self, config: Config, num_tables: int, seed: int):
+    def __init__(self, config: Config, num_tables: int, seed: int | None = None):
         self.config = config
         self.num_tables = num_tables
         self.seed = seed

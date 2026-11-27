@@ -143,7 +143,8 @@ def generate_case(seed, suite, tiny, stage, output):
             frames, causal = local_frames(dataset, tables, skeleton, settings.decoding)
             edge_count = None
 
-        database, task_list, categorical_context, constants = {}, [], {}, 0
+        database, task_list, categorical_context = {}, [], {}
+        constants = constant_binary = clf_count = reg_count = 0
         for name, info in sorted(tables.items()):
             frame = frames[name].copy()
             pk, fks = info["pkey_col"], info["fkey_col_to_pkey_table"]
@@ -153,20 +154,26 @@ def generate_case(seed, suite, tiny, stage, output):
                 values = frame[col]
                 if spec["_stype"] == stype.categorical:
                     categories = spec["categories"]
+                    is_constant = int(values.nunique() < 2)
                     if categories == [0, 1]:
                         frame[col] = values.astype(bool)
                         kind = "clf"
+                        constant_binary += is_constant
                     else:
                         frame[col] = values.map(lambda index: categories[int(index)])
                         kind = None
                         categorical_context.setdefault(name, []).append(col)
-                    constants += int(values.nunique() < 2)
+                    constants += is_constant
                 else:
                     frame[col] = values.astype(np.float64)
                     frame.loc[missing[name][col], col] = np.nan
                     kind = "reg"
                 if kind and frame[col].nunique(dropna=True) > 1:
                     task_list.append([db_id, name, col, [], kind])
+                    if kind == "clf":
+                        clf_count += 1
+                    else:
+                        reg_count += 1
             # Ensure PK-only rows still get physical identities in the paper preprocessor.
             if not frame[list(features(info))].notna().any(axis=1).all():
                 frame["_rt_row"] = f"row of {name}"
@@ -192,16 +199,19 @@ def generate_case(seed, suite, tiny, stage, output):
             "edges": edge_count,
             "requested_edges": len(family.edges) if direct else None,
             "constant_categorical_columns": constants,
+            "constant_binary_columns": constant_binary,
+            "clf_tasks": clf_count,
+            "reg_tasks": reg_count,
             "categorical_context": categorical_context,
             "tasks": task_list,
         }
-    common_targets = set.intersection(
+    # Keep each arm's own varying targets rather than intersecting across arms:
+    # post-treatment binary collapse in original arms must not censor quantile arms.
+    shared_targets = set.intersection(
         *({tuple(task[:3]) for task in arm_info["tasks"]} for arm_info in case["arms"].values())
     )
-    if not common_targets:
-        return {"seed": seed, "rejected": "no shared varying numeric or Boolean targets"}
-    for arm, arm_info in case["arms"].items():
-        arm_info["tasks"] = [t for t in arm_info["tasks"] if tuple(t[:3]) in common_targets]
+    case["shared_targets"] = len(shared_targets)
+    for arm in case["arms"]:
         (output / arm).mkdir(exist_ok=True)
         (stage / arm / db_id).rename(output / arm / db_id)
     return case
@@ -272,6 +282,11 @@ def generate_reference(root, reference, count, seed, tiny):
                 "version": 1,
                 "reference": reference,
                 "reference_revision": REFERENCE_REVISIONS[reference],
+                "categorical_export_policy": (
+                    "plurel_v1_gt0_bool"
+                    if reference == "plurel"
+                    else "binary_bool_multiclass_int64"
+                ),
                 "config": json.loads(canonical_json(config)),
                 "databases": databases,
             },
@@ -325,6 +340,10 @@ def synthesize(root, suite, split, count, seed, workers, tiny):
             raise ValueError(
                 f"Only {len(accepted)} paired databases accepted out of {limit - seed}"
             )
+        rejection_counts: dict[str, int] = {}
+        for item in rejected:
+            reason = item["rejected"]
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
         manifest = {
             "version": 1,
             "suite": suite,
@@ -335,6 +354,7 @@ def synthesize(root, suite, split, count, seed, workers, tiny):
             "revision": revision,
             "source_sha256": source.hexdigest(),
             "config": json.loads(canonical_json(config)),
+            "rejection_counts": rejection_counts,
             "cases": accepted,
             "rejected": rejected,
         }

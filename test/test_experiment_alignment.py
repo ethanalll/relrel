@@ -90,6 +90,9 @@ def test_reference_exports_keep_their_own_table_contract(reference, tmp_path):
     output = tmp_path / "synthetic/reference" / reference
     manifest = json.loads((output / "corpus.json").read_text())
     assert manifest["reference_revision"] == experiments.REFERENCE_REVISIONS[reference]
+    assert manifest["categorical_export_policy"] == (
+        "plurel_v1_gt0_bool" if reference == "plurel" else "binary_bool_multiclass_int64"
+    )
     assert manifest["databases"] == [{"id": "db-00010000", "seed": 10000}]
     database = Database.load(output / "db-00010000/db")
     assert_foreign_keys_valid(database)
@@ -117,15 +120,25 @@ def test_factorial_arms_control_schema_and_graphs(seed, tmp_path):
         info = case["arms"][arm]
         assert info["global_dag"] is global_dag
         assert info["quantiles"] is quantiles
-        assert info["tasks"] == case["arms"]["local-original"]["tasks"]
         assert info["tasks"]
+        assert info["clf_tasks"] + info["reg_tasks"] == len(info["tasks"])
         path = tmp_path / arm / case["id"]
         db = Database.load(path / "db")
         assert_foreign_keys_valid(db)
-        for _, table_name, target, _, _ in info["tasks"]:
-            table = db.table_dict[table_name]
-            assert target not in (table.time_col, table.pkey_col, *table.fkey_col_to_pkey_table)
-            assert table.df[target].nunique(dropna=True) > 1
+        expected_tasks = []
+        for table_name, table in sorted(db.table_dict.items()):
+            for col in sorted(table.df.columns):
+                if col in (table.time_col, table.pkey_col, *table.fkey_col_to_pkey_table):
+                    continue
+                if pd.api.types.is_bool_dtype(table.df[col]):
+                    kind = "clf"
+                elif pd.api.types.is_float_dtype(table.df[col]):
+                    kind = "reg"
+                else:
+                    continue
+                if table.df[col].nunique(dropna=True) > 1:
+                    expected_tasks.append([case["id"], table_name, col, [], kind])
+        assert info["tasks"] == expected_tasks
         generated[arm] = (db, json.loads((path / "causal.json").read_text()))
 
     reference, local = generated["local-original"]
@@ -225,3 +238,41 @@ def test_holdout_preserves_paired_scope_and_decoder_selection(seed, tmp_path):
     assert reference["quantiles"] is bool((seed // 2) % 2)
     db = Database.load(tmp_path / "reference" / case["id"] / "db")
     assert any(table.time_col == "date" for table in db.table_dict.values())
+
+
+def test_sampler_suite_matches_realized_edges(tmp_path):
+    case = make_case(10000, "sampler", True, tmp_path)
+    assert "rejected" not in case, case
+    assert set(case["arms"]) == {"family", "direct"}
+    assert case["arms"]["direct"]["edges"] == case["arms"]["family"]["edges"]
+    assert case["arms"]["direct"]["requested_edges"] == case["arms"]["family"]["edges"]
+
+
+def test_erdos_renyi_deadlock_guard_terminates():
+    from relrel.config import DAGParams
+    from relrel.dag import ErdosRenyi
+
+    # Very low p would spin forever if ErdosRenyi never moved past a disconnected fixed seed.
+    dag = ErdosRenyi(
+        num_nodes=4,
+        dag_params=DAGParams(er_p_choices=Choices("set", [0.15])),
+        seed=0,
+    )
+    assert dag.size() == 4
+
+
+def test_global_schema_rng_does_not_clobber_keyed_stream():
+    # Regression test: seed=0 and seed=1 both use keyed_seed(seed, "schema") cleanly
+    # and reproduce identically regardless of external global RNG state.
+    import numpy as np
+
+    config = experiment_config(True)
+    for seed in (0, 1):
+        np.random.seed(999)
+        first = SyntheticDataset(seed, config)._prepare_global_schema()
+        np.random.seed(12345)
+        second = SyntheticDataset(seed, config)._prepare_global_schema()
+        assert list(first) == list(second)
+        for name in first:
+            assert first[name]["columns"] == second[name]["columns"]
+            assert first[name]["fkey_col_to_pkey_table"] == second[name]["fkey_col_to_pkey_table"]

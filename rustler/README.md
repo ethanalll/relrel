@@ -1,4 +1,9 @@
-# rustler - context sampler for RT, written in Rust
+# rustler - legacy PluRel v1.0.0 context sampler (deprecated here)
+
+> **Note:** This directory is the historical PluRel v1.0.0 copy retained only
+> for reference/legacy CI. For active RelRel–RT experiments (including the
+> `forecast-v1` leakage fix and undated-entity `p2f` support), use
+> `../relational-transformer/rustler/`.
 
 `pre.rs` contains code to preprocess datasets.
 
